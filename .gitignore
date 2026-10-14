@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+
+# Local application state
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
