@@ -385,6 +385,7 @@ def _encode(config: AppConfig) -> bytes:
     return raw
 
 
+
 @contextmanager
 def _write_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
     """Cooperative, cross-process write lock (msvcrt on Windows, flock on POSIX)."""
@@ -404,9 +405,6 @@ def _write_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ConfigError("Settings lock is not a regular file")
 
-        if os.fstat(stream.fileno()).st_size == 0:
-            stream.write(b"\0")
-
         deadline = time.monotonic() + timeout
 
         if os.name == "nt":
@@ -414,11 +412,19 @@ def _write_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
 
             def take() -> None:
                 stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(
+                    stream.fileno(),
+                    msvcrt.LK_NBLCK,
+                    1,
+                )
 
             def release() -> None:
                 stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(
+                    stream.fileno(),
+                    msvcrt.LK_UNLCK,
+                    1,
+                )
 
         else:
             import fcntl
@@ -430,12 +436,16 @@ def _write_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
                 )
 
             def release() -> None:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(
+                    stream.fileno(),
+                    fcntl.LOCK_UN,
+                )
 
         while True:
             try:
                 take()
                 break
+
             except (OSError, BlockingIOError) as exc:
                 if time.monotonic() >= deadline:
                     raise ConfigConflict(
@@ -445,9 +455,16 @@ def _write_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
                 time.sleep(0.025)
 
         try:
+            # Initialize the byte only AFTER acquiring the OS lock.
+            if os.fstat(stream.fileno()).st_size == 0:
+                stream.seek(0)
+                stream.write(b"\0")
+
             yield
+
         finally:
             release()
+
 
 
 class ConfigStore:

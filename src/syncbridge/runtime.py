@@ -55,6 +55,7 @@ class _ProfileLock:
         self.path = path
         self._stream = None
 
+    
     def acquire(self) -> None:
         if self._stream is not None:
             raise RuntimeError("Profile lock already held")
@@ -63,7 +64,9 @@ class _ProfileLock:
             hasattr(os.path, "isjunction")
             and os.path.isjunction(self.path)
         ):
-            raise StartupError("Profile lock cannot be a link or junction")
+            raise StartupError(
+                "Profile lock cannot be a link or junction"
+            )
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -78,11 +81,12 @@ class _ProfileLock:
         stream = os.fdopen(fd, "r+b", buffering=0)
 
         try:
-            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise StartupError("Profile lock must be a regular file")
-
-            if os.fstat(stream.fileno()).st_size == 0:
-                stream.write(b"\0")
+            if not stat.S_ISREG(
+                os.fstat(stream.fileno()).st_mode
+            ):
+                raise StartupError(
+                    "Profile lock must be a regular file"
+                )
 
             stream.seek(0)
 
@@ -95,6 +99,7 @@ class _ProfileLock:
                         msvcrt.LK_NBLCK,
                         1,
                     )
+
                 else:
                     import fcntl
 
@@ -107,6 +112,11 @@ class _ProfileLock:
                 raise InstanceAlreadyRunning(
                     "SyncBridge profile is already in use"
                 ) from exc
+
+            # We now own the lock, so initialization is safe.
+            if os.fstat(stream.fileno()).st_size == 0:
+                stream.seek(0)
+                stream.write(b"\0")
 
             self._stream = stream
 
