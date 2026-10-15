@@ -1,10 +1,9 @@
 
-"""Tkinter desktop for explicitly configured, lease-guarded manual sync.
+"""Tkinter desktop with application-owned LAN presence and guarded manual sync.
 
-Run using `python -m syncbridge.ui.main_window --profile PATH` or the launcher.
-Tk owns the main thread; all potentially blocking network work uses a worker
-thread and a Queue. Closing waits for work to finish and stops every listener.
-No pairing, background sync, silent deletion or automated conflict resolution.
+Discovery starts when the app window opens, independently of Start Connection
+and independently of the Nearby Devices viewer. Beacons are untrusted and do
+NOT expose files or pair devices. No unattended file-changing operations.
 """
 from __future__ import annotations
 
@@ -19,15 +18,18 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from syncbridge.core.review import explain_error
+from syncbridge.network.discovery import DISCOVERY_PORT
 from syncbridge.storage.config import ConfigStore
 from syncbridge.ui.desktop_controller import DesktopController, DesktopPreview
-from syncbridge.ui.nearby_devices import NearbyDevicesWindow
-from syncbridge.network.discovery import DISCOVERY_PORT
+from syncbridge.ui.nearby_devices import DesktopPresence, NearbyDevicesWindow
 
 
 class SyncBridgeWindow:
     def __init__(
-        self, root: tk.Tk, controller: DesktopController, *,
+        self,
+        root: tk.Tk,
+        controller: DesktopController,
+        *,
         discovery_port: int = DISCOVERY_PORT,
         discovery_bind: str = "0.0.0.0",
         discovery_targets: tuple[tuple[str, int], ...] | None = None,
@@ -41,6 +43,8 @@ class SyncBridgeWindow:
         self._preview: DesktopPreview | None = None
         self._worker: threading.Thread | None = None
         self._nearby: NearbyDevicesWindow | None = None
+        self._presence: DesktopPresence | None = None
+        self._discovery_problem: str | None = None
         self._discovery_port = discovery_port
         self._discovery_bind = discovery_bind
         self._discovery_targets = discovery_targets
@@ -56,6 +60,7 @@ class SyncBridgeWindow:
         self.details = tk.StringVar(value="Loading profile...")
         self.summary = tk.StringVar(value="Start the connection to preview changes.")
         self.progress = tk.StringVar(value="")
+        self.presence_status = tk.StringVar(value="Discovery starting...")
 
         outer = ttk.Frame(root, padding=18)
         outer.pack(fill="both", expand=True)
@@ -71,9 +76,10 @@ class SyncBridgeWindow:
         ttk.Entry(profile_row, textvariable=self.profile_path, state="readonly").pack(
             side="left", fill="x", expand=True, padx=8
         )
-        self.choose_button = ttk.Button(profile_row, text="Choose Profile", command=self._choose_profile)
+        self.choose_button = ttk.Button(
+            profile_row, text="Choose Profile", command=self._choose_profile
+        )
         self.choose_button.pack(side="right")
-
         ttk.Label(outer, textvariable=self.details, wraplength=770, justify="left").pack(
             fill="x", pady=(0, 12)
         )
@@ -93,7 +99,12 @@ class SyncBridgeWindow:
         self.nearby_button = ttk.Button(controls, text="Nearby Devices", command=self._open_nearby)
         self.nearby_button.pack(side="right", padx=(0, 8))
 
-        ttk.Label(outer, textvariable=self.summary, wraplength=770).pack(fill="x", pady=(0, 8))
+        ttk.Label(outer, textvariable=self.presence_status, wraplength=770).pack(
+            fill="x", pady=(0, 8)
+        )
+        ttk.Label(outer, textvariable=self.summary, wraplength=770).pack(
+            fill="x", pady=(0, 8)
+        )
         columns = ("action", "path", "note")
         self.table = ttk.Treeview(outer, columns=columns, show="headings", selectmode="browse")
         self.table.heading("action", text="Action")
@@ -116,8 +127,51 @@ class SyncBridgeWindow:
         ).pack(anchor="w")
 
         self._refresh_profile()
+        self._start_presence()  # No click and no existing sync configuration required.
         self._buttons()
         self.root.after(80, self._drain)
+
+    def _start_presence(self) -> None:
+        """Create and start the discovery advertiser for the current profile."""
+        if self._presence is not None:
+            return
+        try:
+            name = self._discovery_name
+            if not name:
+                try:
+                    name = self.controller.store.load().device_name
+                except Exception:
+                    name = None
+            candidate = DesktopPresence(
+                self.controller.store.path.parent,
+                device_name=name,
+                listen_port=self._discovery_port,
+                bind_address=self._discovery_bind,
+                targets=self._discovery_targets,
+            )
+            candidate.start()
+            self._presence = candidate
+            self._discovery_problem = None
+            self.presence_status.set(
+                "Visible to nearby SyncBridge users · Not paired devices cannot access files"
+            )
+        except Exception as exc:
+            self._presence = None
+            self._discovery_problem = str(exc)
+            self.presence_status.set(
+                "Nearby discovery unavailable. Sync still works for already paired devices."
+            )
+
+    def _stop_presence(self) -> None:
+        if self._nearby is not None:
+            self._nearby.close()
+            self._nearby = None
+        if self._presence is not None:
+            try:
+                self._presence.stop()
+            finally:
+                self._presence = None
+        self.presence_status.set("Nearby discovery stopped")
 
     def _refresh_profile(self) -> None:
         try:
@@ -151,46 +205,42 @@ class SyncBridgeWindow:
         chosen = filedialog.askdirectory(title="Choose a SyncBridge profile folder")
         if not chosen:
             return
-        if self._nearby is not None:
-            self._nearby.close()
-            self._nearby = None
         current = self.controller
-        self.controller = DesktopController(
+        replacement = DesktopController(
             ConfigStore(Path(chosen) / "settings.json"),
             bind_address=current.runtime.bind_address,
             listen_ports=current.runtime.listen_ports,
             lock_port=current.runtime.lock_port,
             validation_port=current.runtime.validation_port,
         )
+        self._stop_presence()
+        self.controller = replacement
         self.profile_path.set(chosen)
         self._preview = None
         self._show_rows(())
         self._refresh_profile()
+        self._start_presence()
         self._buttons()
 
     def _open_nearby(self) -> None:
         if self._nearby is not None and not self._nearby._closed:
             self._nearby.focus()
             return
-        try:
-            name = self._discovery_name
-            if not name:
-                try:
-                    name = self.controller.store.load().device_name
-                except Exception:
-                    name = None
-            self._nearby = NearbyDevicesWindow(
-                self.root, self.controller.store.path.parent,
-                device_name=name, listen_port=self._discovery_port,
-                bind_address=self._discovery_bind, targets=self._discovery_targets,
-            )
-        except Exception as exc:
+        if self._presence is None or not self._presence.running:
+            self._start_presence()
+        if self._presence is None or not self._presence.running:
             messagebox.showerror(
                 "Discovery unavailable",
-                f"Could not start nearby-device discovery: {exc}\n\n"
-                "Check whether another SyncBridge instance is using the UDP discovery port.",
+                "SyncBridge could not advertise this computer on the network.\n\n"
+                f"Details: {self._discovery_problem or 'Unknown discovery error'}\n\n"
+                "Check Windows Firewall and whether another app uses the UDP discovery port.",
                 parent=self.root,
             )
+            return
+        try:
+            self._nearby = NearbyDevicesWindow(self.root, self._presence.directory)
+        except Exception as exc:
+            messagebox.showerror("Nearby Devices", str(exc), parent=self.root)
 
     def _run(self, label: str, task) -> None:
         if self._busy or self._closing:
@@ -208,7 +258,9 @@ class SyncBridgeWindow:
             else:
                 self._events.put(("done", (label, result)))
 
-        self._worker = threading.Thread(target=worker, name="SyncBridgeDesktopTask", daemon=False)
+        self._worker = threading.Thread(
+            target=worker, name="SyncBridgeDesktopTask", daemon=False
+        )
         self._worker.start()
 
     def _start(self) -> None:
@@ -357,6 +409,7 @@ class SyncBridgeWindow:
         self._busy = True
         self.state.set("Closing connections...")
         self._buttons()
+
         def stop():
             try:
                 self.controller.stop()
@@ -364,16 +417,17 @@ class SyncBridgeWindow:
                 self._events.put(("shutdown_error", exc))
             else:
                 self._events.put(("shutdown_done", None))
-        self._worker = threading.Thread(target=stop, name="SyncBridgeDesktopShutdown", daemon=False)
+
+        self._worker = threading.Thread(
+            target=stop, name="SyncBridgeDesktopShutdown", daemon=False
+        )
         self._worker.start()
 
     def _close(self) -> None:
         if self._closing:
             return
-        if self._nearby is not None:
-            self._nearby.close()
-            self._nearby = None
         self._closing = True
+        self._stop_presence()  # Advertise until the user actually closes the app.
         self.state.set("Waiting for current operation to finish...")
         self._buttons()
         if not self._busy:

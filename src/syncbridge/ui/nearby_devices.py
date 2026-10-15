@@ -1,9 +1,10 @@
 
-"""Nearby SyncBridge devices: untrusted UDP discovery plus a Tkinter viewer.
+"""Application-owned LAN discovery and a read-only Tkinter peer browser.
 
-Discovery beacons are NOT authenticated, verified identities, pairing requests,
-or permission to read files. The advertised TCP port is reserved for a future
-pairing endpoint; this phase does not open that endpoint or connect to peers.
+Opening SyncBridge starts advertisements. Opening or closing Nearby Devices does
+not start or stop advertisements. Beacons are untrusted and never pair devices,
+open shared files, or grant file permissions. The advertised pairing port is
+reserved for a future listener and is not yet a working pairing endpoint.
 """
 from __future__ import annotations
 
@@ -15,10 +16,7 @@ from pathlib import Path
 from tkinter import ttk
 from typing import Iterable
 
-from syncbridge.network.discovery import (
-    DISCOVERY_PORT,
-    PeerDiscovery,
-)
+from syncbridge.network.discovery import DISCOVERY_PORT, PeerDiscovery
 from syncbridge.network.security import load_or_create_identity
 
 
@@ -31,7 +29,7 @@ class NearbyDevice:
 
 
 class NearbyDirectory:
-    """Headless discovery controller. No trust-store writes or sync operations."""
+    """Headless UDP discovery without trust or sync side effects."""
 
     def __init__(
         self,
@@ -49,7 +47,7 @@ class NearbyDirectory:
         self.discovery = PeerDiscovery(
             node_id,
             device_name,
-            45840,  # Future pairing endpoint: not opened or trusted in this phase.
+            45840,  # Reserved future pairing endpoint; NOT active yet.
             listen_port=listen_port,
             bind_address=bind_address,
             announce_interval=announce_interval,
@@ -96,30 +94,63 @@ class NearbyDirectory:
                 return tuple(results)
 
 
-class NearbyDevicesWindow:
-    """A read-only device browser. All Tk calls run on the GUI thread."""
+class DesktopPresence:
+    """One identity and one background discovery service per open app profile.
+
+    It is deliberately independent of GuardedManualRuntime: a device can be
+    discoverable before a share is configured or a Sync connection is started.
+    Close it with the app, not with the device browser.
+    """
 
     def __init__(
         self,
-        parent: tk.Misc,
         profile: str | Path,
         *,
         device_name: str | None = None,
         listen_port: int = DISCOVERY_PORT,
         bind_address: str = "0.0.0.0",
         targets: Iterable[tuple[str, int]] | None = None,
+        announce_interval: float = 2.0,
+        peer_timeout: float = 8.0,
     ) -> None:
-        profile_path = Path(profile).expanduser().resolve()
-        profile_path.mkdir(parents=True, exist_ok=True)
-        identity = load_or_create_identity(profile_path / "identity.json")
-        name = device_name or socket.gethostname() or "SyncBridge Device"
+        self.profile = Path(profile).expanduser().resolve()
+        self.profile.mkdir(parents=True, exist_ok=True)
+        identity = load_or_create_identity(self.profile / "identity.json")
+        self.node_id = identity.node_id
         self.directory = NearbyDirectory(
             identity.node_id,
-            name,
+            device_name or socket.gethostname() or "SyncBridge Device",
             listen_port=listen_port,
             bind_address=bind_address,
             targets=targets,
+            announce_interval=announce_interval,
+            peer_timeout=peer_timeout,
         )
+
+    @property
+    def running(self) -> bool:
+        return self.directory.running
+
+    def start(self) -> None:
+        self.directory.start()
+
+    def stop(self) -> None:
+        self.directory.stop()
+
+
+class NearbyDevicesWindow:
+    """Read-only UI for the application's ALREADY RUNNING discovery service.
+
+    Closing this window has no effect on whether this computer is visible to
+    peers. The owner (SyncBridgeWindow) stops discovery when the app exits.
+    """
+
+    def __init__(self, parent: tk.Misc, directory: NearbyDirectory) -> None:
+        if not isinstance(directory, NearbyDirectory):
+            raise TypeError("An application-owned NearbyDirectory is required")
+        if not directory.running:
+            raise RuntimeError("Nearby discovery is not running")
+        self.directory = directory
         self.window = tk.Toplevel(parent)
         self.window.title("SyncBridge — Nearby Devices")
         self.window.geometry("680x430")
@@ -133,13 +164,13 @@ class NearbyDevicesWindow:
         outer = ttk.Frame(self.window, padding=16)
         outer.pack(fill="both", expand=True)
         ttk.Label(
-            outer, text="Devices on your local network", font=("Segoe UI", 16, "bold")
+            outer, text="Devices on your network", font=("Segoe UI", 16, "bold")
         ).pack(anchor="w")
         ttk.Label(
             outer,
             text=(
-                "Devices listed here are unverified announcements. "
-                "Discovery does not pair devices or grant file access."
+                "SyncBridge is already discoverable while the app is open. "
+                "These announcements are unverified and do not grant file access."
             ),
             wraplength=640,
         ).pack(anchor="w", pady=(6, 12))
@@ -151,7 +182,7 @@ class NearbyDevicesWindow:
         )
         for key, title, width in (
             ("name", "Device name (unverified)", 220),
-            ("ip", "Network address", 140),
+            ("ip", "Observed address", 140),
             ("trust", "Pairing status", 180),
         ):
             self.table.heading(key, text=title)
@@ -163,35 +194,29 @@ class NearbyDevicesWindow:
 
         buttons = ttk.Frame(outer)
         buttons.pack(fill="x", pady=(12, 6))
-        ttk.Button(buttons, text="Scan Now", command=self._refresh).pack(side="left")
+        ttk.Button(buttons, text="Refresh List", command=self._refresh).pack(side="left")
         ttk.Button(buttons, text="Copy Selected Details", command=self._copy).pack(
             side="left", padx=8
         )
         ttk.Button(buttons, text="Close", command=self.close).pack(side="right")
-        self.message = tk.StringVar(value="Starting discovery...")
+        self.message = tk.StringVar(value="Checking for nearby SyncBridge devices...")
         ttk.Label(outer, textvariable=self.message, wraplength=640).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Pair / Connect will be enabled after secure pairing is implemented.",
+            text="Connect / Pair will be added in the secure pairing phase.",
         ).pack(anchor="w", pady=(6, 0))
-
-        try:
-            self.directory.start()
-        except BaseException:
-            self.window.destroy()
-            raise
         self._tick()
 
     def focus(self) -> None:
         self.window.lift()
-        self.window.focus_force()
+        self.window.focus_set()
 
     def _refresh(self) -> None:
         try:
             self.directory.refresh()
-            self.message.set("Searching the network for SyncBridge devices...")
+            self.message.set("Refreshing visible devices...")
         except Exception as exc:
-            self.message.set(f"Discovery could not send an announcement: {exc}")
+            self.message.set(f"Cannot refresh discovery: {exc}")
 
     def _copy(self) -> None:
         selected = self.table.selection()
@@ -200,7 +225,7 @@ class NearbyDevicesWindow:
             return
         device = self._by_id.get(selected[0])
         if device is None:
-            self.message.set("That device is no longer visible. Refresh and try again.")
+            self.message.set("This device is no longer visible.")
             return
         details = (
             f"Name (unverified): {device.name}\n"
@@ -210,7 +235,7 @@ class NearbyDevicesWindow:
         )
         self.window.clipboard_clear()
         self.window.clipboard_append(details)
-        self.message.set("Unverified discovery details copied. Do not treat these as trusted identity.")
+        self.message.set("Unverified device details copied. Pairing is not established.")
 
     def _tick(self) -> None:
         if self._closed:
@@ -233,11 +258,12 @@ class NearbyDevicesWindow:
         problems = self.directory.errors()
         if problems:
             self.message.set(f"Discovery issue: {problems[-1]}")
-        elif self.message.get().startswith(("Starting", "Searching", "Found", "No devices")):
+        else:
             self.message.set(
                 f"Found {len(devices)} other device(s). "
-                "Keep both apps open; devices disappear after a short timeout."
-                if devices else "No devices yet. Keep SyncBridge open on another computer on the same LAN."
+                "Close this window any time; SyncBridge stays discoverable."
+                if devices
+                else "No devices visible yet. Keep SyncBridge open on the other computer."
             )
         self._after_id = self.window.after(350, self._tick)
 
@@ -250,7 +276,7 @@ class NearbyDevicesWindow:
                 self.window.after_cancel(self._after_id)
             except tk.TclError:
                 pass
-        self.directory.stop()
+        # The main app owns discovery. DO NOT call directory.stop() here.
         try:
             self.window.destroy()
         except tk.TclError:
