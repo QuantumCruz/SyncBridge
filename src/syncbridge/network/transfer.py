@@ -1,11 +1,16 @@
 
-"""Authenticated, resumable file transfer over dedicated encrypted TCP sockets.
+"""Resumable, encrypted transfers with optional strict share binding.
 
-Only explicitly permitted senders may write into a receiver's destination root.
-The sender selects files from an explicitly supplied source root. Transfers do
-not use the PeerManager control connection, so heartbeats remain independent.
+For new deployments configure ``share_id`` on the listening service and
+pass the same ID in send_file/fetch_file. Such listeners reject legacy offers.
+Read and write permissions are separate. Content replacement requires both an
+opt-in receiver and the expected existing SHA-256; deletions are not supported.
+
+The receiver rechecks the existing hash immediately before publishing, but
+ordinary Windows/POSIX filesystem APIs cannot provide atomic hash-and-replace
+against unrelated local writers. Coordinators must serialize local writers and
+retain conflict backups for a production synchronization service.
 """
-
 from __future__ import annotations
 
 import hashlib
@@ -24,25 +29,21 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from .secure_channel import accept_secure_channel, open_secure_channel
-from .security import AuthenticationError, DeviceIdentity, SecurityError, TrustStore
+from .security import DeviceIdentity, SecurityError, TrustStore
 
 logger = logging.getLogger(__name__)
-
-_VERSION = 1
+_VERSION = 2
 _CHUNK_SIZE = 64 * 1024
 _MAX_JSON = 4096
 _MAX_CONNECTIONS = 8
-_MAX_FILE_SIZE = 2**63 - 1
-
+_MAX_SIZE = 2**63 - 1
 _NODE_ID = re.compile(r"[0-9a-f]{32}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_WINDOWS_RESERVED = re.compile(
-    r"(?i)^(con|prn|aux|nul|conin\$|conout\$|com[0-9]|lpt[0-9])(?:\..*)?$"
-)
+_RESERVED = re.compile(r"(?i)^(con|prn|aux|nul|conin\$|conout\$|com[0-9]|lpt[0-9])(?:\..*)?$")
 
 
 class TransferError(Exception):
-    """Rejected or interrupted transfer; incomplete staging files are retained."""
+    """Transfer failed, was refused, or cannot be resumed safely."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,271 +64,161 @@ class TransferResult:
     completed: bool
 
 
-def _path(value: str) -> tuple[str, ...]:
-    if not isinstance(value, str) or not value:
-        raise TransferError("Invalid relative file path")
-
-    try:
-        if len(value.encode("utf-8")) > 1024:
-            raise TransferError("Invalid relative file path")
-    except UnicodeEncodeError as exc:
-        raise TransferError("Invalid Unicode file path") from exc
-
-    if "\\" in value or value.startswith("/") or "//" in value:
-        raise TransferError("Invalid relative file path")
-
-    segments = value.split("/")
-
-    for segment in segments:
-        try:
-            segment_bytes = len(segment.encode("utf-8"))
-        except UnicodeEncodeError as exc:
-            raise TransferError("Invalid Unicode file path") from exc
-
-        if (
-            segment in ("", ".", "..")
-            or segment.endswith((" ", "."))
-            or segment_bytes > 255
-            or any(
-                ord(c) < 32 or ord(c) == 127 or c in '<>:"|?*'
-                for c in segment
-            )
-            or _WINDOWS_RESERVED.fullmatch(segment) is not None
-        ):
-            raise TransferError("Unsafe relative file path")
-
-    return tuple(segments)
-
-
-def _validate_node(value: str) -> str:
-    if not isinstance(value, str) or not _NODE_ID.fullmatch(value):
-        raise ValueError("Expected a 32-character lowercase node ID")
+def _identity(value: str) -> str:
+    if not isinstance(value, str) or _NODE_ID.fullmatch(value) is None:
+        raise ValueError("Expected 32 lowercase hexadecimal characters")
     return value
 
 
+def _sha(value: str | None) -> str | None:
+    if value is not None and (not isinstance(value, str) or _HASH.fullmatch(value) is None):
+        raise TransferError("Invalid SHA-256 precondition")
+    return value
+
+
+def _path(value: str) -> tuple[str, ...]:
+    if not isinstance(value, str) or not value or value.startswith("/") or "\\" in value:
+        raise TransferError("Invalid relative file path")
+    try:
+        if len(value.encode("utf-8")) > 1024:
+            raise TransferError("Path exceeds 1024 bytes")
+    except UnicodeEncodeError as exc:
+        raise TransferError("Invalid Unicode path") from exc
+    segments = value.split("/")
+    for segment in segments:
+        if (
+            segment in ("", ".", "..") or segment.endswith((" ", "."))
+            or len(segment.encode("utf-8")) > 255
+            or any(ord(c) < 32 or ord(c) == 127 or c in '<>:"|?*' for c in segment)
+            or _RESERVED.fullmatch(segment) is not None
+            or segment.casefold() in (".git", ".venv", ".syncbridge", "__pycache__")
+        ):
+            raise TransferError("Unsafe relative file path")
+    return tuple(segments)
+
+
 def _linked(path: Path) -> bool:
-    return path.is_symlink() or (
-        hasattr(os.path, "isjunction") and os.path.isjunction(path)
-    )
+    return path.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(path))
 
 
-def _check_directory(path: Path) -> None:
-    if _linked(path):
-        raise TransferError("Refusing a symbolic link or junction directory")
-
-    if path.exists() and not path.is_dir():
-        raise TransferError("Expected a directory")
-
+def _directory(path: Path) -> None:
+    if _linked(path) or (path.exists() and not path.is_dir()):
+        raise TransferError("Unsafe directory")
     path.mkdir(parents=True, exist_ok=True)
-
     if _linked(path) or not path.is_dir():
         raise TransferError("Unsafe directory")
 
 
-def _safe_child(
-    root: Path,
-    segments: tuple[str, ...],
-    *,
-    create: bool,
-) -> Path:
+def _child(root: Path, segments: tuple[str, ...], *, create: bool = False) -> Path:
     current = root
-
-    for segment in segments[:-1]:
-        current = current / segment
-
+    for part in segments[:-1]:
+        current = current / part
         if _linked(current):
-            raise TransferError(
-                "Path traverses a symbolic link or junction"
-            )
-
+            raise TransferError("Path passes through a link or junction")
         if create:
-            _check_directory(current)
+            _directory(current)
         elif current.exists() and not current.is_dir():
-            raise TransferError(
-                "Parent component is not a directory"
-            )
-
-    leaf = current / segments[-1]
-
-    if _linked(leaf):
-        raise TransferError(
-            "Refusing a symbolic link or junction file"
-        )
-
-    return leaf
+            raise TransferError("Parent component is not a directory")
+    target = current / segments[-1]
+    if _linked(target):
+        raise TransferError("Linked files are not transferable")
+    return target
 
 
-def _regular_or_absent(path: Path) -> None:
+def _regular(path: Path) -> None:
     if _linked(path):
-        raise TransferError("Refusing a linked staging file")
-
+        raise TransferError("Linked staging file")
     try:
-        info = path.lstat()
+        metadata = path.lstat()
     except FileNotFoundError:
         return
-
-    if not stat.S_ISREG(info.st_mode):
-        raise TransferError(
-            "Staging path is not a regular file"
-        )
+    if not stat.S_ISREG(metadata.st_mode):
+        raise TransferError("Staging file must be regular")
 
 
-def _json_packet(connection: object, data: dict) -> None:
-    raw = json.dumps(
-        data,
-        separators=(",", ":"),
-        sort_keys=True,
-        allow_nan=False,
-    ).encode()
-
-    if len(raw) > _MAX_JSON:
-        raise TransferError(
-            "Transfer control message too large"
-        )
-
-    connection.sendall(struct.pack("!I", len(raw)) + raw)
-
-
-def _exact(connection: object, size: int) -> bytes:
-    data = bytearray()
-
-    while len(data) < size:
-        part = connection.recv(size - len(data))
-
-        if not part:
-            raise TransferError(
-                "Transfer connection closed unexpectedly"
-            )
-
-        data.extend(part)
-
-    return bytes(data)
-
-
-def _pairs(pairs: list[tuple[str, object]]) -> dict:
-    result = {}
-
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(
-                "Duplicate transfer control field"
-            )
-        result[key] = value
-
-    return result
-
-
-def _read_json(
-    connection: object,
-    expected: set[str],
-) -> dict:
-    (length,) = struct.unpack(
-        "!I",
-        _exact(connection, 4),
-    )
-
-    if not 0 < length <= _MAX_JSON:
-        raise TransferError(
-            "Invalid transfer control length"
-        )
-
-    try:
-        document = json.loads(
-            _exact(connection, length).decode("utf-8"),
-            object_pairs_hook=_pairs,
-        )
-    except (
-        ValueError,
-        UnicodeDecodeError,
-        RecursionError,
-    ) as exc:
-        raise TransferError(
-            "Malformed transfer control message"
-        ) from exc
-
-    if (
-        not isinstance(document, dict)
-        or document.get("version") != _VERSION
-        or type(document.get("version")) is not int
-    ):
-        raise TransferError(
-            "Unsupported transfer control message"
-        )
-
-    if document.get("type") not in expected:
-        raise TransferError(
-            "Unexpected transfer control message"
-        )
-
-    return document
-
-
-def _response(
-    connection: object,
-    kind: str,
-    **fields: object,
-) -> None:
-    _json_packet(
-        connection,
-        {
-            "version": _VERSION,
-            "type": kind,
-            **fields,
-        },
-    )
-
-
-def _error_or(response: dict, expected: str) -> dict:
-    if response["type"] == "error":
-        raise TransferError(
-            str(
-                response.get(
-                    "reason",
-                    "Remote transfer rejected",
-                )
-            )[:256]
-        )
-
-    if response["type"] != expected:
-        raise TransferError(
-            "Unexpected transfer response"
-        )
-
-    return response
-
-
-def _file_hash(stream: object) -> str:
+def _hash_file(stream) -> str:
     digest = hashlib.sha256()
-
     while chunk := stream.read(1024 * 1024):
         digest.update(chunk)
-
     return digest.hexdigest()
 
 
-def _same_file(
-    before: os.stat_result,
-    after: os.stat_result,
-) -> bool:
-    return (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-    ) == (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
+def _same_stat(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino, a.st_size, a.st_mtime_ns) == (
+        b.st_dev, b.st_ino, b.st_size, b.st_mtime_ns
     )
 
 
-def _close(connection: object) -> None:
+def _send(connection, kind: str, **fields) -> None:
+    raw = json.dumps(
+        {"version": _VERSION, "type": kind, **fields},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    if len(raw) > _MAX_JSON:
+        raise TransferError("Transfer control frame too large")
+    connection.sendall(struct.pack("!I", len(raw)) + raw)
+
+
+def _exact(connection, count: int) -> bytes:
+    result = bytearray()
+    while len(result) < count:
+        chunk = connection.recv(count - len(result))
+        if not chunk:
+            raise TransferError("Transfer stream disconnected")
+        result.extend(chunk)
+    return bytes(result)
+
+
+def _unique(pairs):
+    obj = {}
+    for key, val in pairs:
+        if key in obj:
+            raise ValueError("Duplicate JSON key")
+        obj[key] = val
+    return obj
+
+
+def _read(connection, kinds: set[str]) -> dict:
+    size = struct.unpack("!I", _exact(connection, 4))[0]
+    if not 0 < size <= _MAX_JSON:
+        raise TransferError("Invalid control frame length")
+    try:
+        data = json.loads(
+            _exact(connection, size).decode("utf-8"),
+            object_pairs_hook=_unique,
+            parse_constant=lambda v: (_ for _ in ()).throw(ValueError(v))
+        )
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+        raise TransferError("Invalid control JSON") from exc
+    if (
+        not isinstance(data, dict)
+        or type(data.get("version")) is not int
+        or data["version"] != _VERSION
+        or data.get("type") not in kinds
+    ):
+        raise TransferError("Unexpected transfer message")
+    return data
+
+
+def _expect(data: dict, kind: str, fields: set[str]) -> None:
+    if data["type"] != kind or set(data) != {"version", "type"} | fields:
+        raise TransferError(f"Malformed {kind} message")
+
+
+def _reply(data: dict, kind: str) -> dict:
+    if data["type"] == "error":
+        _expect(data, "error", {"reason"})
+        raise TransferError(str(data["reason"])[:256])
+    if data["type"] != kind:
+        raise TransferError("Unexpected transfer reply")
+    return data
+
+
+def _close(connection) -> None:
     try:
         connection.shutdown(socket.SHUT_RDWR)
     except OSError:
         pass
-
     try:
         connection.close()
     except OSError:
@@ -335,134 +226,71 @@ def _close(connection: object) -> None:
 
 
 class TransferService:
-    """Receive and send explicit pushes using independent encrypted sessions.
+    """One destination root and optionally one strictly bound share identifier.
 
-    The receiving root must be chosen by the user. allowed_senders defaults to
-    empty (deny all). A trusted key alone does not grant write permission.
-
-    Partials live in a sibling staging directory on the same filesystem so a
-    completed file can be published atomically. No existing target is replaced
-    unless allow_overwrite=True is explicitly selected.
+    A share-bound receiver refuses legacy (unscoped) sends and only responds to
+    pull requests from peers in allowed_readers. In legacy mode, only existing
+    push operations are permitted for compatibility with the first milestone.
     """
 
     def __init__(
-        self,
-        identity: DeviceIdentity,
-        trust_store: TrustStore,
-        destination_root: str | Path,
-        *,
-        allowed_senders: Iterable[str] = (),
-        bind_address: str = "0.0.0.0",
-        listen_port: int = 45842,
-        handshake_timeout: float = 5.0,
-        io_timeout: float = 120.0,
+        self, identity: DeviceIdentity, trust_store: TrustStore,
+        destination_root: str | Path, *,
+        allowed_senders: Iterable[str] = (), allowed_readers: Iterable[str] = (),
+        share_id: str | None = None,
+        bind_address: str = "0.0.0.0", listen_port: int = 45842,
+        handshake_timeout: float = 5.0, io_timeout: float = 120.0,
         allow_overwrite: bool = False,
         on_progress: Callable[[TransferProgress], None] | None = None,
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
-        if (
-            not isinstance(identity, DeviceIdentity)
-            or not isinstance(trust_store, TrustStore)
-        ):
-            raise TypeError(
-                "identity and trust_store are required"
-            )
-
-        if (
-            type(listen_port) is not int
-            or not 0 <= listen_port <= 65535
-        ):
-            raise ValueError(
-                "Invalid transfer TCP port"
-            )
-
+        if not isinstance(identity, DeviceIdentity) or not isinstance(trust_store, TrustStore):
+            raise TypeError("Device identity and trust store required")
+        if share_id is not None:
+            _identity(share_id)
+        if type(listen_port) is not int or not 0 <= listen_port <= 65535:
+            raise ValueError("Invalid transfer port")
         try:
-            socket.inet_pton(
-                socket.AF_INET,
-                bind_address,
-            )
+            socket.inet_pton(socket.AF_INET, bind_address)
         except OSError as exc:
-            raise ValueError(
-                "bind_address must be numeric IPv4"
-            ) from exc
-
-        for value in (
-            handshake_timeout,
-            io_timeout,
-        ):
-            if (
-                type(value) not in (int, float)
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(
-                    "Timeouts must be finite positive numbers"
-                )
-
-        if type(allow_overwrite) is not bool:
-            raise TypeError(
-                "allow_overwrite must be bool"
-            )
-
+            raise ValueError("Bind address must be IPv4") from exc
         if any(
-            callback is not None and not callable(callback)
-            for callback in (on_progress, on_error)
+            type(t) not in (float, int) or not math.isfinite(t) or t <= 0
+            for t in (handshake_timeout, io_timeout)
         ):
-            raise TypeError(
-                "Callbacks must be callable or None"
-            )
+            raise ValueError("Invalid timeouts")
+        if type(allow_overwrite) is not bool:
+            raise TypeError("allow_overwrite must be bool")
+        if any(cb is not None and not callable(cb) for cb in (on_progress, on_error)):
+            raise TypeError("Callbacks must be callable")
 
-        self.identity = identity
-        self.trust_store = trust_store
+        self.identity, self.trust_store = identity, trust_store
+        self.destination_root = Path(destination_root).expanduser().absolute()
+        _directory(self.destination_root)
 
-        self.destination_root = (
-            Path(destination_root)
-            .expanduser()
-            .absolute()
-        )
-
-        _check_directory(
-            self.destination_root
-        )
-
-        directory_id = hashlib.sha256(
-            os.fsencode(
-                str(self.destination_root)
-            )
+        folder_hash = hashlib.sha256(
+            os.fsencode(str(self.destination_root))
         ).hexdigest()[:16]
-
         self._staging = (
             self.destination_root.parent
-            / f".syncbridge-transfer-{directory_id}"
+            / f".syncbridge-transfer-{folder_hash}"
         )
+        _directory(self._staging)
 
-        _check_directory(
-            self._staging
-        )
-
-        self._allowed = {
-            _validate_node(item)
-            for item in allowed_senders
-        }
-
-        self.bind_address = bind_address
-        self.listen_port = listen_port
-        self.handshake_timeout = float(
-            handshake_timeout
-        )
+        self.share_id = share_id
+        self._allowed = {_identity(x) for x in allowed_senders}
+        self._readers = {_identity(x) for x in allowed_readers}
+        self.bind_address, self.listen_port = bind_address, listen_port
+        self.handshake_timeout = float(handshake_timeout)
         self.io_timeout = float(io_timeout)
         self.allow_overwrite = allow_overwrite
-
-        self._on_progress = on_progress
-        self._on_error = on_error
+        self._on_progress, self._on_error = on_progress, on_error
 
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._stop.set()
-
         self._listener: socket.socket | None = None
         self._bound_port: int | None = None
-
         self._connections: set[socket.socket] = set()
         self._active_paths: set[str] = set()
         self._threads: set[threading.Thread] = set()
@@ -475,137 +303,107 @@ class TransferService:
     @property
     def is_running(self) -> bool:
         with self._lock:
-            return (
-                self._listener is not None
-                and not self._stop.is_set()
-            )
+            return self._listener is not None and not self._stop.is_set()
 
     def authorize_sender(self, node_id: str) -> None:
-        _validate_node(node_id)
-
         with self._lock:
-            self._allowed.add(node_id)
+            self._allowed.add(_identity(node_id))
 
     def revoke_sender(self, node_id: str) -> None:
-        _validate_node(node_id)
-
         with self._lock:
-            self._allowed.discard(node_id)
+            self._allowed.discard(_identity(node_id))
 
-    def _spawn(
-        self,
-        method: Callable,
-        *args: object,
+    def authorize_reader(self, node_id: str) -> None:
+        with self._lock:
+            self._readers.add(_identity(node_id))
+
+    def revoke_reader(self, node_id: str) -> None:
+        with self._lock:
+            self._readers.discard(_identity(node_id))
+
+    def _check_permission(
+        self, peer_id: str, key: bytes, *,
+        read: bool = False, outbound: bool = False
     ) -> None:
-        def run() -> None:
+        self.trust_store.require(key)
+        if outbound:
+            return
+        with self._lock:
+            allowed = (
+                peer_id in (self._readers if read else self._allowed)
+                and not self._stop.is_set()
+            )
+        if not allowed:
+            raise TransferError(
+                "Device lacks permission to read this share"
+                if read else
+                "Sending device is not authorized for this folder"
+            )
+
+    def _spawn(self, method, *args) -> None:
+        def task():
             try:
                 method(*args)
             finally:
                 with self._lock:
-                    self._threads.discard(
-                        threading.current_thread()
-                    )
-
-        thread = threading.Thread(
-            target=run,
-            daemon=True,
-            name="SyncBridgeTransfer",
+                    self._threads.discard(threading.current_thread())
+        worker = threading.Thread(
+            target=task, name="SyncBridgeTransfer", daemon=True
         )
-
         with self._lock:
-            self._threads.add(thread)
-
-        thread.start()
+            self._threads.add(worker)
+        worker.start()
 
     def start(self) -> None:
         with self._lock:
             if self._listener is not None:
                 return
-
             if self._threads:
-                raise RuntimeError(
-                    "Previous transfer workers are stopping"
-                )
+                raise RuntimeError("Previous transfer workers still stopping")
 
-            connection = socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM,
-            )
-
+            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                connection.setsockopt(
-                    socket.SOL_SOCKET,
-                    socket.SO_REUSEADDR,
-                    1,
+                listener.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
                 )
-
-                connection.bind(
-                    (
-                        self.bind_address,
-                        self.listen_port,
-                    )
-                )
-
-                connection.listen(
-                    _MAX_CONNECTIONS
-                )
-
-                connection.settimeout(0.2)
-
+                listener.bind((self.bind_address, self.listen_port))
+                listener.listen(_MAX_CONNECTIONS)
+                listener.settimeout(0.2)
             except BaseException:
-                connection.close()
+                listener.close()
                 raise
 
-            self._listener = connection
-            self._bound_port = (
-                connection.getsockname()[1]
-            )
+            self._listener = listener
+            self._bound_port = listener.getsockname()[1]
             self._stop.clear()
             self._spawn(self._accept_loop)
 
     def stop(self) -> None:
         with self._lock:
             self._stop.set()
-
-            server, self._listener = (
-                self._listener,
-                None,
-            )
-
+            listener, self._listener = self._listener, None
             self._bound_port = None
+            sockets = tuple(self._connections)
+            threads = tuple(self._threads)
 
-            sockets = tuple(
-                self._connections
-            )
-
-            threads = tuple(
-                self._threads
-            )
-
-        if server is not None:
-            _close(server)
-
-        for connection in sockets:
-            _close(connection)
-
+        if listener:
+            _close(listener)
+        for sock in sockets:
+            _close(sock)
         for thread in threads:
             if thread is not threading.current_thread():
-                thread.join(timeout=2.0)
+                thread.join(timeout=2)
 
     def _accept_loop(self) -> None:
         while not self._stop.is_set():
             with self._lock:
-                server = self._listener
-
-            if server is None:
+                listener = self._listener
+            if listener is None:
                 return
-
             try:
-                connection, _ = server.accept()
-
+                sock, _ = listener.accept()
             except socket.timeout:
                 continue
-
             except OSError as exc:
                 if not self._stop.is_set():
                     self._report(exc)
@@ -614,532 +412,506 @@ class TransferService:
             with self._lock:
                 accepted = (
                     not self._stop.is_set()
-                    and len(self._connections)
-                    < _MAX_CONNECTIONS
+                    and len(self._connections) < _MAX_CONNECTIONS
                 )
-
                 if accepted:
-                    self._connections.add(connection)
+                    self._connections.add(sock)
 
             if accepted:
-                self._spawn(
-                    self._serve,
-                    connection,
-                )
+                self._spawn(self._serve, sock)
             else:
-                _close(connection)
+                _close(sock)
 
-    def _serve(
-        self,
-        connection: socket.socket,
-    ) -> None:
+    def _verify_share(self, provided: str | None) -> None:
+        if provided != self.share_id:
+            raise TransferError("Unknown or mismatched transfer share")
+
+    def _serve(self, sock: socket.socket) -> None:
         secure = None
-
         try:
             secure, peer = accept_secure_channel(
-                connection,
-                self.identity,
-                self.trust_store,
-                timeout=self.handshake_timeout,
+                sock, self.identity, self.trust_store,
+                timeout=self.handshake_timeout
             )
+            secure.settimeout(self.io_timeout)
+            request = _read(secure, {"offer", "get"})
 
-            secure.settimeout(
-                self.io_timeout
-            )
-
-            with self._lock:
-                allowed = (
-                    peer.node_id in self._allowed
-                    and not self._stop.is_set()
+            if request["type"] == "offer":
+                self._check_permission(
+                    peer.node_id, secure.remote_public_key
                 )
-
-            if not allowed:
-                raise TransferError(
-                    "Sending device is not authorized for this folder"
+                if self.share_id is None:
+                    _expect(
+                        request, "offer",
+                        {"path", "size", "sha256"}
+                    )
+                else:
+                    _expect(
+                        request, "offer",
+                        {
+                            "path", "size", "sha256", "share_id",
+                            "expected_destination_sha256"
+                        }
+                    )
+                    self._verify_share(request["share_id"])
+                self._receive(
+                    secure, peer.node_id, request, outbound=False
                 )
-
-            request = _read_json(
-                secure,
-                {"offer"},
-            )
-
-            self._receive_file(
-                secure,
-                peer.node_id,
-                request,
-            )
-
-        except (
-            OSError,
-            TransferError,
-            SecurityError,
-        ) as exc:
-            if (
-                secure is not None
-                and not self._stop.is_set()
-            ):
+            else:
+                _expect(
+                    request, "get",
+                    {
+                        "share_id", "path",
+                        "expected_source_sha256",
+                        "expected_destination_sha256"
+                    }
+                )
+                self._verify_share(request["share_id"])
+                if self.share_id is None:
+                    raise TransferError(
+                        "Pull requires a configured share"
+                    )
+                self._check_permission(
+                    peer.node_id, secure.remote_public_key, read=True
+                )
+                self._send_source(
+                    secure, peer.node_id, self.destination_root,
+                    request["path"],
+                    share_id=self.share_id,
+                    expected_source=request["expected_source_sha256"],
+                    expected_destination=request["expected_destination_sha256"],
+                    outbound=False
+                )
+        except (OSError, TransferError, SecurityError, ValueError) as exc:
+            if secure is not None and not self._stop.is_set():
                 try:
-                    _response(
-                        secure,
-                        "error",
-                        reason=str(exc)[:256],
+                    _send(
+                        secure, "error", reason=str(exc)[:256]
                     )
                 except OSError:
                     pass
-
             if not self._stop.is_set():
                 self._report(exc)
-
         finally:
-            _close(connection)
-
+            _close(sock)
             with self._lock:
-                self._connections.discard(
-                    connection
+                self._connections.discard(sock)
+
+    def _precondition(
+        self, target: Path, size: int, digest: str,
+        expected: str | None, *, strict: bool
+    ) -> bool:
+        if not target.exists():
+            if expected is not None:
+                raise TransferError(
+                    "Destination disappeared; expected existing file"
+                )
+            return False
+        if not target.is_file():
+            raise TransferError("Destination is not a regular file")
+
+        with target.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            current_hash = _hash_file(stream)
+            if not _same_stat(
+                before, os.fstat(stream.fileno())
+            ):
+                raise TransferError(
+                    "Destination changed while checking precondition"
                 )
 
-    def _receive_file(
-        self,
-        secure: object,
-        sender_id: str,
-        offer: dict,
-    ) -> None:
-        if set(offer) != {
-            "version",
-            "type",
-            "path",
-            "size",
-            "sha256",
-        }:
-            raise TransferError(
-                "Invalid file offer"
-            )
+        if current_hash == digest and target.stat().st_size == size:
+            return True
 
+        if not self.allow_overwrite:
+            raise TransferError(
+                "Destination already exists; conflict resolution required"
+            )
+        if strict and expected is None:
+            raise TransferError(
+                "Conditional overwrite requires expected destination SHA-256"
+            )
+        if expected is not None and current_hash != expected:
+            raise TransferError(
+                "Destination changed; expected SHA-256 mismatch"
+            )
+        return False
+
+    def _receive(
+        self, secure, sender_id: str, offer: dict, *,
+        outbound: bool, cancel_event=None, on_progress=None
+    ) -> TransferResult:
+        segments = _path(offer["path"])
         relative = offer["path"]
-        segments = _path(relative)
+        size, digest = offer["size"], offer["sha256"]
 
-        size = offer["size"]
-        digest = offer["sha256"]
-
-        if (
-            type(size) is not int
-            or not 0 <= size <= _MAX_FILE_SIZE
-        ):
-            raise TransferError(
-                "Invalid file size"
-            )
-
-        if (
-            not isinstance(digest, str)
-            or not _HASH.fullmatch(digest)
-        ):
-            raise TransferError(
-                "Invalid content hash"
-            )
+        if type(size) is not int or not 0 <= size <= _MAX_SIZE:
+            raise TransferError("Invalid file size")
+        if not isinstance(digest, str) or _HASH.fullmatch(digest) is None:
+            raise TransferError("Invalid content hash")
+        expected = _sha(
+            offer.get("expected_destination_sha256")
+        )
 
         with self._lock:
             if relative in self._active_paths:
-                raise TransferError(
-                    "A transfer for this path is already active"
-                )
-
+                raise TransferError("Transfer for path already active")
             self._active_paths.add(relative)
 
         try:
-            self._receive_locked(
-                secure,
-                sender_id,
-                relative,
-                segments,
-                size,
-                digest,
+            if not outbound:
+                self._check_permission(
+                    sender_id, secure.remote_public_key
+                )
+
+            target = _child(
+                self.destination_root, segments
+            )
+            strict = (
+                self.share_id is not None
+                or "share_id" in offer
+            )
+            if self._precondition(
+                target, size, digest, expected, strict=strict
+            ):
+                _send(
+                    secure, "already_complete", size=size, sha256=digest
+                )
+                return TransferResult(
+                    relative, digest, size, size, True
+                )
+
+            slot = hashlib.sha256(
+                f"{sender_id}\0{offer.get('share_id', self.share_id)}\0"
+                f"{relative}\0{size}\0{digest}\0{expected}".encode("utf-8")
+            ).hexdigest()
+
+            partial = self._staging / (slot + ".part")
+            metadata = self._staging / (slot + ".json")
+
+            _regular(partial)
+            _regular(metadata)
+
+            manifest = {
+                "sender": sender_id,
+                "share_id": offer.get("share_id", self.share_id),
+                "path": relative,
+                "size": size,
+                "sha256": digest,
+                "expected": expected
+            }
+
+            if partial.exists() and metadata.exists():
+                try:
+                    old = json.loads(
+                        metadata.read_text("utf-8")
+                    )
+                except (ValueError, UnicodeError) as exc:
+                    raise TransferError(
+                        "Corrupt resume metadata"
+                    ) from exc
+
+                if old != manifest:
+                    raise TransferError(
+                        "Resume metadata mismatch"
+                    )
+
+                offset = partial.stat().st_size
+                if offset > size:
+                    raise TransferError(
+                        "Partial exceeds offered file size"
+                    )
+            else:
+                partial.unlink(missing_ok=True)
+                metadata.unlink(missing_ok=True)
+
+                with metadata.open(
+                    "x", encoding="utf-8"
+                ) as stream:
+                    json.dump(
+                        manifest, stream, sort_keys=True
+                    )
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+                with partial.open("xb"):
+                    pass
+                offset = 0
+
+            _send(secure, "ready", offset=offset)
+            received = offset
+
+            if outbound:
+                self._progress(
+                    "receive", sender_id, relative,
+                    received, size, on_progress
+                )
+
+            with partial.open("ab", buffering=0) as output:
+                while received < size:
+                    self._check_permission(
+                        sender_id, secure.remote_public_key,
+                        outbound=outbound
+                    )
+                    length = struct.unpack(
+                        "!I", _exact(secure, 4)
+                    )[0]
+
+                    if length == 0:
+                        paused = _read(
+                            secure, {"pause"}
+                        )
+                        _expect(paused, "pause", set())
+                        os.fsync(output.fileno())
+                        _send(
+                            secure, "paused", offset=received
+                        )
+                        return TransferResult(
+                            relative, digest, size, received, False
+                        )
+
+                    if (
+                        length > _CHUNK_SIZE
+                        or length > size - received
+                    ):
+                        raise TransferError(
+                            "Invalid file chunk length"
+                        )
+
+                    output.write(_exact(secure, length))
+                    received += length
+
+                    self._progress(
+                        "receive", sender_id, relative,
+                        received, size, on_progress
+                    )
+
+                    if (
+                        cancel_event is not None
+                        and cancel_event.is_set()
+                    ):
+                        os.fsync(output.fileno())
+                        return TransferResult(
+                            relative, digest, size, received, False
+                        )
+
+                os.fsync(output.fileno())
+
+            if struct.unpack(
+                "!I", _exact(secure, 4)
+            )[0] != 0:
+                raise TransferError(
+                    "Missing end-of-file marker"
+                )
+
+            _expect(
+                _read(secure, {"finish"}),
+                "finish", set()
+            )
+            self._check_permission(
+                sender_id, secure.remote_public_key,
+                outbound=outbound
+            )
+
+            with partial.open("rb") as stream:
+                calculated = _hash_file(stream)
+
+            if (
+                calculated != digest
+                or partial.stat().st_size != size
+            ):
+                partial.unlink(missing_ok=True)
+                metadata.unlink(missing_ok=True)
+                raise TransferError(
+                    "File hash mismatch; corrupt partial discarded"
+                )
+
+            self._check_permission(
+                sender_id, secure.remote_public_key,
+                outbound=outbound
+            )
+
+            target = _child(
+                self.destination_root, segments, create=True
+            )
+
+            if self._precondition(
+                target, size, digest, expected, strict=strict
+            ):
+                # Correct file appeared during transfer; no rewrite.
+                partial.unlink(missing_ok=True)
+                metadata.unlink(missing_ok=True)
+
+            elif target.exists():
+                os.replace(partial, target)
+                metadata.unlink(missing_ok=True)
+
+            else:
+                # Atomic create-if-absent on the same filesystem.
+                os.link(partial, target)
+                partial.unlink()
+                metadata.unlink(missing_ok=True)
+
+            _send(
+                secure, "complete", size=size, sha256=digest
+            )
+            return TransferResult(
+                relative, digest, size, size, True
             )
 
         finally:
             with self._lock:
-                self._active_paths.discard(
-                    relative
-                )
+                self._active_paths.discard(relative)
 
-    def _receive_locked(
-        self,
-        secure: object,
-        sender_id: str,
-        relative: str,
-        segments: tuple[str, ...],
-        size: int,
-        digest: str,
-    ) -> None:
-        # No directories are created in the visible tree before verification.
-        destination = _safe_child(
-            self.destination_root,
-            segments,
-            create=False,
+    def _transmit(
+        self, secure, peer_id: str, stream,
+        before: os.stat_result, digest: str, relative: str,
+        *, cancel_event, on_progress, outbound: bool
+    ) -> TransferResult:
+        answer = _read(
+            secure, {"ready", "error", "already_complete"}
         )
 
-        if destination.exists():
-            if not destination.is_file():
-                raise TransferError(
-                    "Destination is not a regular file"
-                )
-
-            if destination.stat().st_size == size:
-                with destination.open("rb") as existing_file:
-                    if _file_hash(existing_file) == digest:
-                        _response(
-                            secure,
-                            "already_complete",
-                            size=size,
-                            sha256=digest,
-                        )
-                        return
-
-            if not self.allow_overwrite:
-                raise TransferError(
-                    "Destination already exists; conflict resolution required"
-                )
-
-        slot = hashlib.sha256(
-            f"{sender_id}\0{relative}\0{size}\0{digest}".encode("utf-8")
-        ).hexdigest()
-
-        partial = self._staging / (
-            slot + ".part"
-        )
-
-        metadata = self._staging / (
-            slot + ".json"
-        )
-
-        _regular_or_absent(partial)
-        _regular_or_absent(metadata)
-
-        manifest = {
-            "sender": sender_id,
-            "path": relative,
-            "size": size,
-            "sha256": digest,
-        }
-
-        if partial.exists() and metadata.exists():
-            try:
-                stored = json.loads(
-                    metadata.read_text("utf-8")
-                )
-            except (
-                ValueError,
-                UnicodeError,
-            ) as exc:
-                raise TransferError(
-                    "Corrupted transfer resume metadata"
-                ) from exc
-
-            if stored != manifest:
-                raise TransferError(
-                    "Transfer resume metadata mismatch"
-                )
-
-            offset = partial.stat().st_size
-
-            if offset > size:
-                raise TransferError(
-                    "Partial file exceeds advertised size"
-                )
-
-        else:
-            partial.unlink(
-                missing_ok=True
+        if answer["type"] == "already_complete":
+            _expect(
+                answer, "already_complete", {"size", "sha256"}
             )
-            metadata.unlink(
-                missing_ok=True
+            if (
+                type(answer["size"]) is not int
+                or answer["size"] != before.st_size
+                or answer["sha256"] != digest
+            ):
+                raise TransferError(
+                    "Invalid already-complete receipt"
+                )
+
+            return TransferResult(
+                relative, digest, before.st_size,
+                before.st_size, True
             )
 
-            with metadata.open(
-                "x",
-                encoding="utf-8",
-            ) as stream:
-                json.dump(
-                    manifest,
-                    stream,
-                    sort_keys=True,
-                )
-                stream.flush()
-                os.fsync(
-                    stream.fileno()
-                )
+        _expect(
+            _reply(answer, "ready"),
+            "ready", {"offset"}
+        )
+        offset = answer["offset"]
 
-            with partial.open("xb"):
-                pass
+        if (
+            type(offset) is not int
+            or not 0 <= offset <= before.st_size
+        ):
+            raise TransferError("Invalid resume offset")
 
-            offset = 0
+        stream.seek(offset)
+        sent = offset
 
-        _response(
-            secure,
-            "ready",
-            offset=offset,
+        self._progress(
+            "send", peer_id, relative, sent,
+            before.st_size, on_progress
         )
 
-        transferred = offset
+        while sent < before.st_size:
+            self._check_permission(
+                peer_id, secure.remote_public_key,
+                read=not outbound, outbound=outbound
+            )
 
-        with partial.open(
-            "ab",
-            buffering=0,
-        ) as output:
-            while transferred < size:
-                self._check_authorized(
-                    sender_id,
-                    secure,
+            if (
+                cancel_event is not None
+                and cancel_event.is_set()
+            ):
+                secure.sendall(struct.pack("!I", 0))
+                _send(secure, "pause")
+
+                reply = _reply(
+                    _read(secure, {"paused", "error"}),
+                    "paused"
                 )
-
-                (length,) = struct.unpack(
-                    "!I",
-                    _exact(secure, 4),
+                _expect(
+                    reply, "paused", {"offset"}
                 )
-
-                if length == 0:
-                    control = _read_json(
-                        secure,
-                        {"pause"},
-                    )
-
-                    if set(control) != {
-                        "version",
-                        "type",
-                    }:
-                        raise TransferError(
-                            "Invalid pause message"
-                        )
-
-                    os.fsync(
-                        output.fileno()
-                    )
-
-                    _response(
-                        secure,
-                        "paused",
-                        offset=transferred,
-                    )
-                    return
 
                 if (
-                    length > _CHUNK_SIZE
-                    or length > size - transferred
+                    type(reply["offset"]) is not int
+                    or reply["offset"] != sent
                 ):
                     raise TransferError(
-                        "Invalid file chunk length"
+                        "Invalid pause response"
                     )
 
-                output.write(
-                    _exact(secure, length)
+                return TransferResult(
+                    relative, digest, before.st_size,
+                    sent, False
                 )
 
-                transferred += length
+            chunk = stream.read(
+                min(_CHUNK_SIZE, before.st_size - sent)
+            )
 
-                self._progress(
-                    "receive",
-                    sender_id,
-                    relative,
-                    transferred,
-                    size,
+            if not chunk:
+                raise TransferError(
+                    "Source truncated during transfer"
                 )
 
-            os.fsync(
-                output.fileno()
+            secure.sendall(
+                struct.pack("!I", len(chunk)) + chunk
+            )
+            sent += len(chunk)
+
+            self._progress(
+                "send", peer_id, relative, sent,
+                before.st_size, on_progress
             )
 
-        (marker,) = struct.unpack(
-            "!I",
-            _exact(secure, 4),
-        )
-
-        if marker != 0:
-            raise TransferError(
-                "Expected end-of-file marker"
-            )
-
-        control = _read_json(
-            secure,
-            {"finish"},
-        )
-
-        if set(control) != {
-            "version",
-            "type",
-        }:
-            raise TransferError(
-                "Invalid finish message"
-            )
-
-        self._check_authorized(
-            sender_id,
-            secure,
-        )
-
-        with partial.open("rb") as check:
-            actual = _file_hash(check)
-
-        if (
-            actual != digest
-            or partial.stat().st_size != size
+        if not _same_stat(
+            before, os.fstat(stream.fileno())
         ):
-            partial.unlink(
-                missing_ok=True
-            )
-            metadata.unlink(
-                missing_ok=True
-            )
-
             raise TransferError(
-                "File hash mismatch; corrupted partial discarded"
+                "Source changed during transfer"
             )
 
-        destination = _safe_child(
-            self.destination_root,
-            segments,
-            create=True,
+        secure.sendall(struct.pack("!I", 0))
+        _send(secure, "finish")
+
+        receipt = _reply(
+            _read(secure, {"complete", "error"}),
+            "complete"
+        )
+        _expect(
+            receipt, "complete", {"size", "sha256"}
         )
 
         if (
-            destination.exists()
-            and not self.allow_overwrite
+            type(receipt["size"]) is not int
+            or receipt["size"] != before.st_size
+            or receipt["sha256"] != digest
         ):
             raise TransferError(
-                "Destination appeared while transfer was running"
+                "Invalid completion receipt"
             )
 
-        if self.allow_overwrite:
-            os.replace(
-                partial,
-                destination,
-            )
-        else:
-            # Hard-link creates the destination atomically WITHOUT overwriting it.
-            # Stage and destination are on the same filesystem by construction.
-            os.link(
-                partial,
-                destination,
-            )
-            partial.unlink()
-
-        metadata.unlink(
-            missing_ok=True
+        self._check_permission(
+            peer_id, secure.remote_public_key,
+            read=not outbound, outbound=outbound
+        )
+        return TransferResult(
+            relative, digest, before.st_size,
+            sent, True
         )
 
-        _response(
-            secure,
-            "complete",
-            size=size,
-            sha256=digest,
-        )
-
-    def _check_authorized(
-        self,
-        sender_id: str,
-        secure: object,
-    ) -> None:
-        with self._lock:
-            allowed = (
-                sender_id in self._allowed
-                and not self._stop.is_set()
-            )
-
-        if not allowed:
-            raise TransferError(
-                "Sender permission revoked during transfer"
-            )
-
-        self.trust_store.require(
-            secure.remote_public_key
-        )
-
-    def send_file(
-        self,
-        host: str,
-        port: int,
-        expected_node_id: str,
-        source_root: str | Path,
-        relative_path: str,
-        *,
-        cancel_event: threading.Event | None = None,
-        on_progress: Callable[[TransferProgress], None] | None = None,
+    def _send_source(
+        self, secure, peer_id: str, root: Path,
+        relative: str, *, share_id: str | None,
+        expected_source: str | None,
+        expected_destination: str | None,
+        cancel_event=None, on_progress=None,
+        outbound: bool
     ) -> TransferResult:
-        """Push one file. Cancellation retains a resumable partial on the receiver."""
-        _validate_node(
-            expected_node_id
-        )
+        segments = _path(relative)
+        _sha(expected_source)
+        _sha(expected_destination)
 
-        if (
-            type(port) is not int
-            or not 1 <= port <= 65535
-        ):
-            raise ValueError(
-                "Invalid remote transfer port"
-            )
-
-        if not isinstance(host, str):
-            raise ValueError(
-                "Remote host must be numeric IPv4"
-            )
-
-        try:
-            destination_ip = ipaddress.IPv4Address(
-                host
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "Remote host must be numeric IPv4"
-            ) from exc
-
-        if (
-            destination_ip.is_unspecified
-            or destination_ip.is_multicast
-            or host == "255.255.255.255"
-        ):
-            raise ValueError(
-                "Remote host must be unicast IPv4"
-            )
-
-        if expected_node_id == self.identity.node_id:
-            raise TransferError(
-                "Cannot transfer to our own device"
-            )
-
-        if (
-            on_progress is not None
-            and not callable(on_progress)
-        ):
-            raise TypeError(
-                "on_progress must be callable or None"
-            )
-
-        if (
-            cancel_event is not None
-            and not isinstance(cancel_event, threading.Event)
-        ):
-            raise TypeError(
-                "cancel_event must be threading.Event or None"
-            )
-
-        segments = _path(
-            relative_path
-        )
-
-        root = (
-            Path(source_root)
-            .expanduser()
-            .absolute()
-        )
-
-        if not root.is_dir() or _linked(root):
-            raise TransferError(
-                "Invalid shared source directory"
-            )
-
-        source = _safe_child(
-            root,
-            segments,
-            create=False,
-        )
+        source = _child(root, segments)
 
         flags = (
             os.O_RDONLY
@@ -1148,326 +920,306 @@ class TransferService:
         )
 
         try:
-            fd = os.open(
-                source,
-                flags,
-            )
+            fd = os.open(source, flags)
         except OSError as exc:
             raise TransferError(
-                f"Cannot open source file: {exc}"
+                f"Cannot read source: {exc}"
             ) from exc
 
-        with os.fdopen(fd, "rb") as input_file:
-            before = os.fstat(
-                input_file.fileno()
-            )
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
 
-            if not stat.S_ISREG(
-                before.st_mode
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_size > _MAX_SIZE
             ):
                 raise TransferError(
-                    "Source must be a regular file"
+                    "Source must be a regular file of supported size"
                 )
 
-            if before.st_size > _MAX_FILE_SIZE:
-                raise TransferError(
-                    "File is too large"
-                )
+            digest = _hash_file(stream)
 
-            digest = _file_hash(
-                input_file
-            )
-
-            if not _same_file(
-                before,
-                os.fstat(input_file.fileno()),
+            if not _same_stat(
+                before, os.fstat(stream.fileno())
             ):
                 raise TransferError(
                     "Source changed while hashing"
                 )
 
-            input_file.seek(0)
-
-            try:
-                connection = socket.create_connection(
-                    (host, port),
-                    timeout=self.handshake_timeout,
-                )
-            except OSError as exc:
+            if (
+                expected_source is not None
+                and expected_source != digest
+            ):
                 raise TransferError(
-                    f"Cannot reach receiver: {exc}"
-                ) from exc
-
-            try:
-                secure, peer = open_secure_channel(
-                    connection,
-                    self.identity,
-                    self.trust_store,
-                    expected_node_id,
-                    timeout=self.handshake_timeout,
+                    "Source changed from expected SHA-256"
                 )
 
-                secure.settimeout(
-                    self.io_timeout
-                )
+            stream.seek(0)
 
-                _response(
-                    secure,
-                    "offer",
-                    path=relative_path,
+            if share_id is None:
+                _send(
+                    secure, "offer",
+                    path=relative,
+                    size=before.st_size,
+                    sha256=digest
+                )
+            else:
+                _send(
+                    secure, "offer",
+                    path=relative,
                     size=before.st_size,
                     sha256=digest,
+                    share_id=share_id,
+                    expected_destination_sha256=expected_destination
                 )
 
-                reply = _read_json(
-                    secure,
-                    {
-                        "ready",
-                        "error",
-                        "already_complete",
-                    },
+            return self._transmit(
+                secure, peer_id, stream, before,
+                digest, relative,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                outbound=outbound
+            )
+
+    def _connect(
+        self, host: str, port: int, expected_id: str
+    ):
+        _identity(expected_id)
+        if expected_id == self.identity.node_id:
+            raise TransferError("Cannot transfer to self")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("Invalid remote port")
+        if not isinstance(host, str):
+            raise ValueError("Expected a numeric IPv4 host")
+
+        try:
+            address = ipaddress.IPv4Address(host)
+        except ValueError as exc:
+            raise ValueError(
+                "Expected a numeric IPv4 host"
+            ) from exc
+
+        if (
+            address.is_unspecified
+            or address.is_multicast
+            or str(address) == "255.255.255.255"
+        ):
+            raise ValueError("Invalid remote address")
+
+        try:
+            sock = socket.create_connection(
+                (str(address), port),
+                timeout=self.handshake_timeout
+            )
+        except OSError as exc:
+            raise TransferError(
+                f"Cannot reach remote device: {exc}"
+            ) from exc
+
+        try:
+            secure, peer = open_secure_channel(
+                sock, self.identity, self.trust_store,
+                expected_id, timeout=self.handshake_timeout
+            )
+            secure.settimeout(self.io_timeout)
+            return sock, secure, peer
+        except BaseException:
+            _close(sock)
+            raise
+
+    def send_file(
+        self, host: str, port: int,
+        expected_node_id: str,
+        source_root: str | Path,
+        relative_path: str, *,
+        share_id: str | None = None,
+        expected_destination_sha256: str | None = None,
+        cancel_event: threading.Event | None = None,
+        on_progress: Callable[[TransferProgress], None] | None = None
+    ) -> TransferResult:
+        """Push a file, enforcing the receiver's optional share binding."""
+        if share_id is not None:
+            _identity(share_id)
+
+        if self.share_id is not None and self.share_id != share_id:
+            raise TransferError(
+                "Local service is configured for another share"
+            )
+        if (
+            share_id is None
+            and expected_destination_sha256 is not None
+        ):
+            raise ValueError(
+                "Conditional writes require share_id"
+            )
+
+        _sha(expected_destination_sha256)
+
+        if (
+            cancel_event is not None
+            and not isinstance(cancel_event, threading.Event)
+        ):
+            raise TypeError(
+                "cancel_event must be threading.Event"
+            )
+        if on_progress is not None and not callable(on_progress):
+            raise TypeError("on_progress must be callable")
+
+        _path(relative_path)
+        root = Path(source_root).expanduser().absolute()
+
+        if _linked(root) or not root.is_dir():
+            raise TransferError(
+                "Invalid shared source directory"
+            )
+
+        try:
+            sock, secure, peer = self._connect(
+                host, port, expected_node_id
+            )
+        except SecurityError as exc:
+            raise TransferError(
+                f"Secure transfer failed: {exc}"
+            ) from exc
+
+        try:
+            return self._send_source(
+                secure, peer.node_id, root, relative_path,
+                share_id=share_id,
+                expected_source=None,
+                expected_destination=expected_destination_sha256,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                outbound=True
+            )
+        except (OSError, SecurityError) as exc:
+            raise TransferError(
+                f"Secure transfer failed: {exc}"
+            ) from exc
+        finally:
+            _close(sock)
+
+    def fetch_file(
+        self, host: str, port: int,
+        expected_node_id: str,
+        share_id: str, relative_path: str, *,
+        expected_source_sha256: str | None = None,
+        expected_destination_sha256: str | None = None,
+        cancel_event: threading.Event | None = None,
+        on_progress: Callable[[TransferProgress], None] | None = None
+    ) -> TransferResult:
+        """Download a file from a peer granting explicit share-read access."""
+        _identity(share_id)
+        _path(relative_path)
+        _sha(expected_source_sha256)
+        _sha(expected_destination_sha256)
+
+        if (
+            self.share_id is not None
+            and self.share_id != share_id
+        ):
+            raise TransferError(
+                "Local receiver is configured for another share"
+            )
+
+        if (
+            cancel_event is not None
+            and not isinstance(cancel_event, threading.Event)
+        ):
+            raise TypeError(
+                "cancel_event must be threading.Event"
+            )
+        if (
+            on_progress is not None
+            and not callable(on_progress)
+        ):
+            raise TypeError(
+                "on_progress must be callable"
+            )
+
+        try:
+            sock, secure, peer = self._connect(
+                host, port, expected_node_id
+            )
+        except SecurityError as exc:
+            raise TransferError(
+                f"Secure transfer failed: {exc}"
+            ) from exc
+
+        try:
+            _send(
+                secure, "get",
+                share_id=share_id,
+                path=relative_path,
+                expected_source_sha256=expected_source_sha256,
+                expected_destination_sha256=expected_destination_sha256
+            )
+
+            offer = _read(
+                secure, {"offer", "error"}
+            )
+            _reply(offer, "offer")
+
+            _expect(
+                offer, "offer",
+                {
+                    "share_id", "path", "size",
+                    "sha256", "expected_destination_sha256"
+                }
+            )
+
+            if (
+                offer["share_id"] != share_id
+                or offer["path"] != relative_path
+                or offer["expected_destination_sha256"]
+                    != expected_destination_sha256
+                or (
+                    expected_source_sha256 is not None
+                    and offer["sha256"] != expected_source_sha256
                 )
-
-                if reply["type"] == "already_complete":
-                    if (
-                        set(reply) != {
-                            "version",
-                            "type",
-                            "size",
-                            "sha256",
-                        }
-                        or type(reply["size"]) is not int
-                        or reply["size"] != before.st_size
-                        or reply["sha256"] != digest
-                    ):
-                        raise TransferError(
-                            "Invalid already-complete receipt"
-                        )
-
-                    return TransferResult(
-                        relative_path,
-                        digest,
-                        before.st_size,
-                        before.st_size,
-                        True,
-                    )
-
-                _error_or(
-                    reply,
-                    "ready",
-                )
-
-                if set(reply) != {
-                    "version",
-                    "type",
-                    "offset",
-                }:
-                    raise TransferError(
-                        "Invalid transfer resume response"
-                    )
-
-                offset = reply["offset"]
-
-                if (
-                    type(offset) is not int
-                    or not 0 <= offset <= before.st_size
-                ):
-                    raise TransferError(
-                        "Invalid remote resume offset"
-                    )
-
-                input_file.seek(
-                    offset
-                )
-
-                sent = offset
-
-                self._progress(
-                    "send",
-                    peer.node_id,
-                    relative_path,
-                    sent,
-                    before.st_size,
-                    on_progress,
-                )
-
-                while sent < before.st_size:
-                    if (
-                        cancel_event is not None
-                        and cancel_event.is_set()
-                    ):
-                        secure.sendall(
-                            struct.pack("!I", 0)
-                        )
-
-                        _response(
-                            secure,
-                            "pause",
-                        )
-
-                        paused = _error_or(
-                            _read_json(
-                                secure,
-                                {
-                                    "paused",
-                                    "error",
-                                },
-                            ),
-                            "paused",
-                        )
-
-                        if (
-                            type(paused.get("offset")) is not int
-                            or paused["offset"] != sent
-                        ):
-                            raise TransferError(
-                                "Invalid remote pause offset"
-                            )
-
-                        return TransferResult(
-                            relative_path,
-                            digest,
-                            before.st_size,
-                            sent,
-                            False,
-                        )
-
-                    chunk = input_file.read(
-                        min(
-                            _CHUNK_SIZE,
-                            before.st_size - sent,
-                        )
-                    )
-
-                    if not chunk:
-                        raise TransferError(
-                            "Source truncated during transfer"
-                        )
-
-                    secure.sendall(
-                        struct.pack(
-                            "!I",
-                            len(chunk),
-                        ) + chunk
-                    )
-
-                    sent += len(chunk)
-
-                    self._progress(
-                        "send",
-                        peer.node_id,
-                        relative_path,
-                        sent,
-                        before.st_size,
-                        on_progress,
-                    )
-
-                if not _same_file(
-                    before,
-                    os.fstat(
-                        input_file.fileno()
-                    ),
-                ):
-                    raise TransferError(
-                        "Source changed during transfer"
-                    )
-
-                secure.sendall(
-                    struct.pack("!I", 0)
-                )
-
-                _response(
-                    secure,
-                    "finish",
-                )
-
-                done = _error_or(
-                    _read_json(
-                        secure,
-                        {
-                            "complete",
-                            "error",
-                        },
-                    ),
-                    "complete",
-                )
-
-                if (
-                    set(done) != {
-                        "version",
-                        "type",
-                        "size",
-                        "sha256",
-                    }
-                    or type(done["size"]) is not int
-                    or done["size"] != before.st_size
-                    or done["sha256"] != digest
-                ):
-                    raise TransferError(
-                        "Invalid transfer completion receipt"
-                    )
-
-                self.trust_store.require(
-                    secure.remote_public_key
-                )
-
-                return TransferResult(
-                    relative_path,
-                    digest,
-                    before.st_size,
-                    sent,
-                    True,
-                )
-
-            except (
-                OSError,
-                SecurityError,
-            ) as exc:
+            ):
                 raise TransferError(
-                    f"Secure file transfer failed: {exc}"
-                ) from exc
+                    "Remote offer differs from requested file/preconditions"
+                )
 
-            finally:
-                _close(connection)
+            return self._receive(
+                secure, peer.node_id, offer,
+                outbound=True,
+                cancel_event=cancel_event,
+                on_progress=on_progress
+            )
+        except (OSError, SecurityError) as exc:
+            raise TransferError(
+                f"Secure transfer failed: {exc}"
+            ) from exc
+        finally:
+            _close(sock)
 
     def _progress(
-        self,
-        direction: str,
-        peer_id: str,
-        path: str,
-        transferred: int,
-        total: int,
-        callback: Callable[[TransferProgress], None] | None = None,
-    ) -> None:
-        update = TransferProgress(
-            direction,
-            peer_id,
-            path,
-            transferred,
-            total,
+        self, direction, peer_id, path,
+        transferred, total, listener=None
+    ):
+        event = TransferProgress(
+            direction, peer_id, path,
+            transferred, total
         )
-
-        for listener in (
-            self._on_progress,
-            callback,
-        ):
-            if listener is not None:
+        for callback in (self._on_progress, listener):
+            if callback is not None:
                 try:
-                    listener(update)
+                    callback(event)
                 except Exception:
                     logger.exception(
-                        "Transfer progress callback failed"
+                        "Progress callback failed"
                     )
 
-    def _report(self, error: Exception) -> None:
+    def _report(self, exc: Exception) -> None:
         if self._on_error is None:
             logger.warning(
-                "SyncBridge transfer: %s",
-                error,
+                "SyncBridge transfer: %s", exc
             )
         else:
             try:
-                self._on_error(error)
+                self._on_error(exc)
             except Exception:
                 logger.exception(
                     "Transfer error callback failed"
