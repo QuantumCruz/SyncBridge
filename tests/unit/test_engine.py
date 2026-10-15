@@ -16,7 +16,6 @@ from syncbridge.core.reconciler import IncompleteScanError
 
 def test_initial_scan_creates_baseline_no_notification(tmp_path):
     (tmp_path / "existing.txt").write_bytes(b"x")
-
     events = []
     engine = SyncEngine(tmp_path, events.append)
 
@@ -37,7 +36,6 @@ def test_followup_changes_are_stored_and_reported(tmp_path):
     engine = SyncEngine(tmp_path, events.append)
 
     engine.check_once()
-
     file = tmp_path / "a.txt"
     file.write_bytes(b"first")
 
@@ -129,7 +127,6 @@ def test_database_failure_does_not_lose_change(tmp_path, monkeypatch):
 def test_incomplete_scan_preserves_db(tmp_path, monkeypatch):
     important = tmp_path / "important.txt"
     important.write_bytes(b"important")
-
     engine = SyncEngine(tmp_path, lambda diff: None)
     engine.check_once()
 
@@ -224,6 +221,7 @@ def test_engine_start_detects_offline_changes(tmp_path):
         assert [
             change.path for change in events[0].added
         ] == ["offline.txt"]
+
     finally:
         engine.stop()
 
@@ -241,7 +239,6 @@ def test_watchers_accept_handed_off_baseline(tmp_path):
     )
 
     result = watcher.poll_once()
-
     assert len(result.added) == 1
     assert events == [result]
 
@@ -293,6 +290,12 @@ def test_external_database_path_allowed_and_unsafe_internal_path_rejected(
 
 
 def test_custom_exclusions_persist_across_watcher(tmp_path):
+    """Wait for the persisted result, not merely the change notification.
+
+    SyncEngine deliberately notifies observers before saving to SQLite.
+    The watcher executes in a background thread, so notification and
+    persistence are separate observable moments.
+    """
     events = []
 
     engine = SyncEngine(
@@ -308,15 +311,28 @@ def test_custom_exclusions_persist_across_watcher(tmp_path):
         (tmp_path / "ignored.tmp").write_bytes(b"data")
         (tmp_path / "included.txt").write_bytes(b"data")
 
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 3.0
+        persisted_files = []
 
-        while not events and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            snapshot = engine.database.load_snapshot(tmp_path)
+            persisted_files = list(snapshot.files)
+
+            if events and persisted_files == ["included.txt"]:
+                break
+
             time.sleep(0.01)
 
-        assert len(events) >= 1
-        assert list(
-            engine.database.load_snapshot(tmp_path).files
-        ) == ["included.txt"]
+        assert events, (
+            "The background watcher did not report the "
+            "included file within 3 seconds."
+        )
+
+        assert persisted_files == ["included.txt"], (
+            "The watcher reported a change, but the expected "
+            "filtered inventory was not persisted within 3 seconds. "
+            f"Actual persisted files: {persisted_files}"
+        )
 
     finally:
         engine.stop()
