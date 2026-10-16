@@ -1,9 +1,9 @@
 
-"""SyncBridge desktop: auto-discovery, explicit pairing, guarded manual sync.
+"""SyncBridge desktop: auto-discovery, verified pairing, folder setup, manual sync.
 
-Pairing is a separate consent process, not a file-share permission. Both the
-pairing TCP listener and discovery UDP service live as long as the app profile
-is open. Network work and file sync run outside the Tk event loop.
+The setup service creates DISABLED shares without file grants. Only a separate
+explicit activation step can enable a share for guarded synchronization.
+All blocking file sync and folder-request work occurs off the Tk event loop.
 """
 from __future__ import annotations
 
@@ -20,8 +20,10 @@ from tkinter import filedialog, messagebox, ttk
 from syncbridge.core.review import explain_error
 from syncbridge.network.discovery import DISCOVERY_PORT
 from syncbridge.network.pairing import PAIRING_PORT
+from syncbridge.network.share_setup import SETUP_PORT
 from syncbridge.storage.config import ConfigStore
 from syncbridge.ui.desktop_controller import DesktopController, DesktopPreview
+from syncbridge.ui.folder_setup_desktop import FolderSetupController, FolderSetupUI
 from syncbridge.ui.nearby_devices import DesktopPresence, NearbyDevicesWindow
 from syncbridge.ui.pairing_desktop import DesktopPairingUI, PairingController
 
@@ -35,6 +37,8 @@ class SyncBridgeWindow:
         discovery_name: str | None = None,
         pairing_port: int = PAIRING_PORT,
         pairing_bind: str = "0.0.0.0",
+        setup_port: int = SETUP_PORT,
+        remote_setup_port: int = SETUP_PORT,
     ) -> None:
         self.root = root
         self.controller = controller
@@ -46,6 +50,7 @@ class SyncBridgeWindow:
         self._nearby: NearbyDevicesWindow | None = None
         self._presence: DesktopPresence | None = None
         self._pairing: DesktopPairingUI | None = None
+        self._folders: FolderSetupUI | None = None
         self._discovery_problem: str | None = None
         self._discovery_port = discovery_port
         self._discovery_bind = discovery_bind
@@ -53,17 +58,19 @@ class SyncBridgeWindow:
         self._discovery_name = discovery_name
         self._pairing_port = pairing_port
         self._pairing_bind = pairing_bind
+        self._setup_port = setup_port
+        self._remote_setup_port = remote_setup_port
 
         root.title("SyncBridge — Manual Sync Beta")
-        root.geometry("875x615")
-        root.minsize(690, 490)
+        root.geometry("930x630")
+        root.minsize(750, 510)
         root.protocol("WM_DELETE_WINDOW", self._close)
         self.state = tk.StringVar(value="Not connected")
         self.profile_path = tk.StringVar(value=str(controller.store.path.parent))
         self.details = tk.StringVar(value="Loading profile...")
-        self.summary = tk.StringVar(value="Start the connection to preview changes.")
+        self.summary = tk.StringVar(value="Pair with a device, then set up folders.")
         self.progress = tk.StringVar(value="")
-        self.presence_status = tk.StringVar(value="Starting device discovery and pairing...")
+        self.presence_status = tk.StringVar(value="Starting discovery, pairing and folder setup...")
 
         outer = ttk.Frame(root, padding=18)
         outer.pack(fill="both", expand=True)
@@ -81,10 +88,9 @@ class SyncBridgeWindow:
             profile_row, text="Choose Profile", command=self._choose_profile,
         )
         self.choose_button.pack(side="right")
-        ttk.Label(outer, textvariable=self.details, wraplength=800, justify="left").pack(
+        ttk.Label(outer, textvariable=self.details, wraplength=860, justify="left").pack(
             fill="x", pady=(0, 12),
         )
-
         controls = ttk.Frame(outer)
         controls.pack(fill="x", pady=(0, 12))
         self.start_button = ttk.Button(controls, text="Start Connection", command=self._start)
@@ -99,11 +105,12 @@ class SyncBridgeWindow:
         self.folder_button.pack(side="right")
         self.nearby_button = ttk.Button(controls, text="Nearby Devices", command=self._open_nearby)
         self.nearby_button.pack(side="right", padx=(0, 8))
-
-        ttk.Label(outer, textvariable=self.presence_status, wraplength=800).pack(
+        self.setup_button = ttk.Button(controls, text="Set Up Folder", command=self._setup_folder)
+        self.setup_button.pack(side="right", padx=(0, 8))
+        ttk.Label(outer, textvariable=self.presence_status, wraplength=860).pack(
             fill="x", pady=(0, 8),
         )
-        ttk.Label(outer, textvariable=self.summary, wraplength=800).pack(
+        ttk.Label(outer, textvariable=self.summary, wraplength=860).pack(
             fill="x", pady=(0, 8),
         )
         frame = ttk.Frame(outer)
@@ -111,10 +118,10 @@ class SyncBridgeWindow:
         self.table = ttk.Treeview(
             frame, columns=("action", "path", "note"), show="headings", selectmode="browse",
         )
-        for name, heading, width in (
+        for name, label, width in (
             ("action", "Action", 125), ("path", "File", 260), ("note", "Meaning", 350),
         ):
-            self.table.heading(name, text=heading)
+            self.table.heading(name, text=label)
             self.table.column(name, width=width, stretch=(name != "action"))
         scroll = ttk.Scrollbar(frame, command=self.table.yview)
         self.table.configure(yscrollcommand=scroll.set)
@@ -122,12 +129,11 @@ class SyncBridgeWindow:
         scroll.pack(side="right", fill="y")
         footer = ttk.Frame(root, padding=(18, 5, 18, 14))
         footer.pack(side="bottom", fill="x")
-        ttk.Label(footer, textvariable=self.progress, wraplength=800).pack(anchor="w")
+        ttk.Label(footer, textvariable=self.progress, wraplength=860).pack(anchor="w")
         ttk.Label(
             footer,
-            text="Manual operations only · Pairing grants no file access · Deletions require review",
+            text="Manual operations only · Newly configured folders stay disabled · No automatic deletion",
         ).pack(anchor="w")
-
         self._refresh_profile()
         self._start_presence()
         self._buttons()
@@ -144,87 +150,109 @@ class SyncBridgeWindow:
     def _start_presence(self) -> None:
         if self._presence is not None:
             return
-        pairing = None
-        presence = None
+        pairing = presence = folders = None
         try:
+            profile = self.controller.store.path.parent
             pairing = DesktopPairingUI(
                 self.root,
                 PairingController(
-                    self.controller.store.path.parent,
-                    self._display_name() or "SyncBridge Device",
-                    bind_address=self._pairing_bind,
-                    port=self._pairing_port,
+                    profile, self._display_name() or "SyncBridge Device",
+                    bind_address=self._pairing_bind, port=self._pairing_port,
                 ),
             )
             pairing.start()
             presence = DesktopPresence(
-                self.controller.store.path.parent,
-                device_name=self._display_name(),
-                listen_port=self._discovery_port,
-                bind_address=self._discovery_bind,
-                targets=self._discovery_targets,
-                pairing_port=pairing.controller.port,
+                profile, device_name=self._display_name(),
+                listen_port=self._discovery_port, bind_address=self._discovery_bind,
+                targets=self._discovery_targets, pairing_port=pairing.controller.port,
             )
             presence.start()
-            self._pairing = pairing
-            self._presence = presence
+            sync_ports = self.controller.runtime.listen_ports or (45843, 45842, 45844)
+            folders = FolderSetupUI(
+                self.root,
+                FolderSetupController(
+                    self.controller.store, bind_address=self._pairing_bind,
+                    listen_port=self._setup_port, remote_port=self._remote_setup_port,
+                    sync_ports=tuple(sync_ports),
+                ),
+                visible_devices=presence.directory.devices,
+                on_saved=self._folder_saved,
+            )
+            folders.start()
+            self._pairing, self._presence, self._folders = pairing, presence, folders
             self._discovery_problem = None
             self.presence_status.set(
-                "Discoverable · Incoming pairing requests require your approval · No files shared"
+                "Discoverable · Device pairing and folder requests require approval"
             )
         except Exception as exc:
+            if folders is not None:
+                folders.stop()
             if presence is not None:
                 presence.stop()
             if pairing is not None:
                 pairing.stop()
-            self._pairing = None
-            self._presence = None
+            self._pairing = self._presence = self._folders = None
             self._discovery_problem = str(exc)
-            self.presence_status.set("Discovery/pairing unavailable; existing sync profiles may still work.")
+            self.presence_status.set("Discovery/setup unavailable; existing synced profiles may still work.")
 
     def _stop_presence(self) -> None:
         if self._nearby is not None:
             self._nearby.close()
             self._nearby = None
+        if self._folders is not None:
+            self._folders.stop()
+            self._folders = None
         if self._presence is not None:
-            try:
-                self._presence.stop()
-            finally:
-                self._presence = None
+            self._presence.stop()
+            self._presence = None
         if self._pairing is not None:
-            try:
-                self._pairing.stop()
-            finally:
-                self._pairing = None
-        self.presence_status.set("Nearby discovery and pairing stopped")
+            self._pairing.stop()
+            self._pairing = None
+        self.presence_status.set("Discovery, pairing and folder setup stopped")
+
+    def _folder_saved(self) -> None:
+        self._refresh_profile()
+        self._buttons()
 
     def _refresh_profile(self) -> None:
+        settings = self.controller.store.load()
         try:
             profile = self.controller.profile()
-        except Exception as exc:
-            self.details.set(f"This profile is not ready: {exc}")
+        except Exception:
+            disabled = [share for share in settings.shares if not share.enabled]
+            self.details.set(
+                f"Device: {settings.device_name} · {len(disabled)} inactive folder relationship(s).\n"
+                "Pair with a computer and select Set Up Folder. "
+                "A separate activation step will enable synchronization."
+            )
             self.state.set("Setup required")
         else:
             self.details.set(
-                f"{profile.device_name}  ·  {profile.folder_name}\n"
+                f"{profile.device_name} · {profile.folder_name}\n"
                 f"Local folder: {profile.local_root}\n"
-                f"Paired computer: {profile.remote_host}  ·  ID {profile.peer_node_id[:12]}…"
+                f"Paired computer: {profile.remote_host} · ID {profile.peer_node_id[:12]}…"
             )
             self.state.set("Connected" if self.controller.running else "Ready to connect")
 
     def _buttons(self) -> None:
         ready = not (self._busy or self._closing)
         running = self.controller.running
+        try:
+            self.controller.profile()
+            configured = True
+        except Exception:
+            configured = False
         self.choose_button.configure(state="normal" if ready and not running else "disabled")
-        self.start_button.configure(state="normal" if ready and not running else "disabled")
+        self.start_button.configure(state="normal" if ready and not running and configured else "disabled")
         self.stop_button.configure(state="normal" if ready and running else "disabled")
         self.preview_button.configure(state="normal" if ready and running else "disabled")
         self.sync_button.configure(
             state="normal" if ready and running and self._preview is not None
             and not self._preview.requires_review else "disabled"
         )
-        self.folder_button.configure(state="normal" if ready else "disabled")
+        self.folder_button.configure(state="normal" if ready and configured else "disabled")
         self.nearby_button.configure(state="normal" if not self._closing else "disabled")
+        self.setup_button.configure(state="normal" if ready and not running and self._folders else "disabled")
 
     def _choose_profile(self) -> None:
         chosen = filedialog.askdirectory(title="Choose a SyncBridge profile folder")
@@ -266,6 +294,10 @@ class SyncBridgeWindow:
             is_trusted=self._pairing.trusted,
         )
 
+    def _setup_folder(self) -> None:
+        if self._folders is not None and not self.controller.running:
+            self._folders.request()
+
     def _run(self, label: str, task) -> None:
         if self._busy or self._closing:
             return
@@ -301,14 +333,13 @@ class SyncBridgeWindow:
         self._run("Checking both folders...", self.controller.preview)
 
     def _request_sync(self) -> None:
-        current = self._preview
-        if current is None or current.requires_review:
+        if self._preview is None or self._preview.requires_review:
             return
         if not messagebox.askyesno(
             "Confirm synchronization",
             "SyncBridge will rescan both folders before transferring files.\n\n"
-            "Additions and updates may be copied in either direction. Conflicts and "
-            "deletions will not be resolved automatically.\n\nContinue?",
+            "Additions and updates may be copied in either direction. "
+            "Conflicts and deletions will not be resolved automatically.\n\nContinue?",
             parent=self.root,
         ):
             return
@@ -454,7 +485,7 @@ class SyncBridgeWindow:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SyncBridge guarded manual desktop beta")
+    parser = argparse.ArgumentParser(description="SyncBridge manual desktop beta")
     parser.add_argument("--profile", type=Path, help="Existing local profile directory")
     parser.add_argument("--bind-address", default="127.0.0.1")
     parser.add_argument("--listen-ports", nargs=3, type=int,
@@ -466,29 +497,32 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discovery-name", default=None)
     parser.add_argument("--pairing-port", type=int, default=PAIRING_PORT)
     parser.add_argument("--pairing-bind", default="0.0.0.0")
+    parser.add_argument("--setup-port", type=int, default=SETUP_PORT)
+    parser.add_argument("--remote-setup-port", type=int, default=SETUP_PORT)
     parser.add_argument("--discovery-target", action="append", metavar="IP:PORT")
-    options = parser.parse_args(argv)
-    store = ConfigStore(options.profile / "settings.json" if options.profile else None)
+    args = parser.parse_args(argv)
+    store = ConfigStore(args.profile / "settings.json" if args.profile else None)
     controller = DesktopController(
-        store, bind_address=options.bind_address,
-        listen_ports=tuple(options.listen_ports) if options.listen_ports else None,
-        lock_port=options.lock_port, validation_port=options.validation_port,
+        store, bind_address=args.bind_address,
+        listen_ports=tuple(args.listen_ports) if args.listen_ports else None,
+        lock_port=args.lock_port, validation_port=args.validation_port,
     )
     targets = None
-    if options.discovery_target:
+    if args.discovery_target:
         try:
             targets = tuple(
                 (host, int(port))
-                for host, port in (value.rsplit(":", 1) for value in options.discovery_target)
+                for host, port in (value.rsplit(":", 1) for value in args.discovery_target)
             )
         except (ValueError, TypeError) as exc:
             parser.error(f"Invalid --discovery-target: {exc}")
     root = tk.Tk()
     SyncBridgeWindow(
-        root, controller, discovery_port=options.discovery_port,
-        discovery_bind=options.discovery_bind, discovery_targets=targets,
-        discovery_name=options.discovery_name, pairing_port=options.pairing_port,
-        pairing_bind=options.pairing_bind,
+        root, controller, discovery_port=args.discovery_port,
+        discovery_bind=args.discovery_bind, discovery_targets=targets,
+        discovery_name=args.discovery_name, pairing_port=args.pairing_port,
+        pairing_bind=args.pairing_bind, setup_port=args.setup_port,
+        remote_setup_port=args.remote_setup_port,
     )
     root.mainloop()
     return 0
