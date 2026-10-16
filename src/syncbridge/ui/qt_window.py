@@ -13,6 +13,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -163,6 +164,38 @@ QMenu::item:selected {
 QMenu::item:disabled {
     color: #728198;
 }
+
+/* Force readable colors for modal dialogs, even in Windows dark mode. */
+QMessageBox {
+    background-color: #ffffff;
+    color: #17263c;
+}
+
+QMessageBox QLabel {
+    background-color: transparent;
+    color: #17263c;
+    font-family: 'Segoe UI';
+    font-size: 10pt;
+}
+
+QMessageBox QPushButton {
+    color: #17263c;
+    background-color: #f6f9ff;
+    border: 1px solid #cbd7e7;
+    border-radius: 7px;
+    padding: 8px 16px;
+    min-width: 64px;
+}
+
+QMessageBox QPushButton:hover {
+    color: #124d9c;
+    background-color: #eaf2ff;
+}
+
+QMessageBox QPushButton:disabled {
+    color: #728198;
+    background-color: #f3f5f8;
+}
 """
 
 
@@ -172,8 +205,6 @@ class SyncBridgeQtWindow(QMainWindow):
     def __init__(self, controller: DesktopController) -> None:
         super().__init__()
 
-        # Use a valid point-sized base font to avoid Qt inheriting
-        # an invalid (-1) point size from a pixel-sized system font.
         self.setFont(QFont("Segoe UI", 10))
 
         self.controller = controller
@@ -200,6 +231,13 @@ class SyncBridgeQtWindow(QMainWindow):
         self.setWindowTitle("SyncBridge")
         self.resize(1000, 690)
         self.setMinimumSize(760, 510)
+
+        # Apply the light theme to the whole Qt application, including
+        # confirmation and warning dialogs created later.
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(STYLE)
+
         self.setStyleSheet(STYLE)
 
         root = QWidget()
@@ -348,23 +386,16 @@ class SyncBridgeQtWindow(QMainWindow):
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(
-            [
-                "Action",
-                "File",
-                "What happens",
-            ]
+            ["Action", "File", "What happens"]
         )
 
         self.table.verticalHeader().setVisible(False)
-
         self.table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers
         )
-
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
-
         self.table.setAlternatingRowColors(True)
 
         self.table.horizontalHeader().setSectionResizeMode(
@@ -416,32 +447,26 @@ class SyncBridgeQtWindow(QMainWindow):
             profile = self.controller.profile()
         except Exception:
             self._configured = False
-
             self.connection.setText(
                 "No synchronized folder configured yet"
             )
-
             self.hint.setText(
                 "For now, pair computers and choose folders "
                 "in the existing SyncBridge desktop app. "
                 "This new interface handles an already-connected folder."
             )
-
             self.status.setText("Setup needed")
             return
 
         self._configured = True
-
         self.connection.setText(
             f"{profile.folder_name}  ·  {profile.device_name}\n"
             f"My folder: {profile.local_root}\n"
             f"Paired computer: {profile.remote_host}"
         )
-
         self.hint.setText(
             "Your files stay on your two computers."
         )
-
         self.status.setText("Connecting...")
 
     def _update_buttons(self) -> None:
@@ -451,7 +476,6 @@ class SyncBridgeQtWindow(QMainWindow):
         self.preview_button.setEnabled(
             ready and running
         )
-
         self.sync_button.setEnabled(
             ready
             and running
@@ -459,17 +483,12 @@ class SyncBridgeQtWindow(QMainWindow):
             and not self._preview.requires_review
             and bool(self._preview.items)
         )
-
         self.open_folder_button.setEnabled(
             ready and self._configured
         )
-
         self.reconnect_action.setEnabled(
-            ready
-            and self._configured
-            and not running
+            ready and self._configured and not running
         )
-
         self.disconnect_action.setEnabled(
             ready and running
         )
@@ -487,7 +506,6 @@ class SyncBridgeQtWindow(QMainWindow):
             return
 
         self._busy = True
-
         self.status.setText(
             {
                 "connect": "Connecting...",
@@ -496,7 +514,6 @@ class SyncBridgeQtWindow(QMainWindow):
                 "stop": "Disconnecting...",
             }[name]
         )
-
         self._update_buttons()
 
         def runner() -> None:
@@ -528,7 +545,6 @@ class SyncBridgeQtWindow(QMainWindow):
     def _disconnect(self) -> None:
         self._preview = None
         self.table.setRowCount(0)
-
         self._work(
             "stop",
             self.controller.stop,
@@ -537,7 +553,6 @@ class SyncBridgeQtWindow(QMainWindow):
     def _check_changes(self) -> None:
         self._preview = None
         self._update_buttons()
-
         self._work(
             "preview",
             self.controller.preview,
@@ -645,21 +660,17 @@ class SyncBridgeQtWindow(QMainWindow):
                 "Conflicts or deletions need review "
                 "before SyncBridge can continue."
             )
-
         elif not plan.items:
             self.summary.setText(
                 "Everything is up to date."
             )
-
         else:
             self.summary.setText(
                 f"{len(plan.items)} change(s) found. "
                 "Review the list, then choose Sync files."
             )
 
-        self.status.setText(
-            "Changes checked"
-        )
+        self.status.setText("Changes checked")
 
     def _finish(
         self,
@@ -667,19 +678,13 @@ class SyncBridgeQtWindow(QMainWindow):
         result: object,
     ) -> None:
         if name == "connect":
-            self.status.setText(
-                "Connected"
-            )
-
+            self.status.setText("Connected")
             self.summary.setText(
                 "Connected. Check changes whenever you're ready."
             )
 
         elif name == "stop":
-            self.status.setText(
-                "Disconnected"
-            )
-
+            self.status.setText("Disconnected")
             self.summary.setText(
                 "Connection stopped."
             )
@@ -689,21 +694,14 @@ class SyncBridgeQtWindow(QMainWindow):
 
         elif name == "sync":
             if result.complete:
-                self.status.setText(
-                    "Synchronized"
-                )
-
+                self.status.setText("Synchronized")
                 self.summary.setText(
                     f"Finished. Sent {len(result.uploaded)} file(s) "
                     f"and received {len(result.downloaded)} file(s). "
                     "Check changes again to see the latest state."
                 )
-
             else:
-                self.status.setText(
-                    "Needs attention"
-                )
-
+                self.status.setText("Needs attention")
                 self.summary.setText(
                     "Synchronization paused safely. "
                     "Check changes before retrying."
@@ -714,9 +712,7 @@ class SyncBridgeQtWindow(QMainWindow):
     def _drain(self) -> None:
         for _ in range(100):
             try:
-                kind, payload = (
-                    self._events.get_nowait()
-                )
+                kind, payload = self._events.get_nowait()
             except queue.Empty:
                 break
 
@@ -732,24 +728,17 @@ class SyncBridgeQtWindow(QMainWindow):
 
                 elif kind == "done":
                     self._busy = False
-
                     if not self._closing:
                         self._finish(*payload)
 
                 elif kind == "error":
                     self._busy = False
-
                     if not self._closing:
                         name, error = payload
-
-                        self.status.setText(
-                            "Needs attention"
-                        )
-
+                        self.status.setText("Needs attention")
                         self.summary.setText(
                             f"Could not complete {name}: {error}"
                         )
-
                         QMessageBox.warning(
                             self,
                             "SyncBridge",
@@ -764,11 +753,7 @@ class SyncBridgeQtWindow(QMainWindow):
                 elif kind == "shutdown-error":
                     self._closing = False
                     self._shutting_down = False
-
-                    self.status.setText(
-                        "Could not close"
-                    )
-
+                    self.status.setText("Could not close")
                     QMessageBox.warning(
                         self,
                         "Shutdown issue",
@@ -778,11 +763,7 @@ class SyncBridgeQtWindow(QMainWindow):
             except Exception as exc:
                 self._busy = False
                 self._preview = None
-
-                self.status.setText(
-                    "Needs attention"
-                )
-
+                self.status.setText("Needs attention")
                 self.summary.setText(
                     "Couldn't display an operation result: "
                     f"{exc}"
@@ -799,9 +780,7 @@ class SyncBridgeQtWindow(QMainWindow):
 
     def _shutdown(self) -> None:
         self._shutting_down = True
-        self.status.setText(
-            "Closing..."
-        )
+        self.status.setText("Closing...")
 
         def runner() -> None:
             try:
@@ -835,15 +814,10 @@ class SyncBridgeQtWindow(QMainWindow):
 
         if not self._closing:
             self._closing = True
-
-            self.status.setText(
-                "Closing..."
-            )
-
+            self.status.setText("Closing...")
             self.summary.setText(
                 "Finishing the current operation before closing."
             )
-
             self._update_buttons()
 
             if not self._busy:
