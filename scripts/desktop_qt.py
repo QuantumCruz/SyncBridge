@@ -1,5 +1,5 @@
 
-"""Launch SyncBridge's PySide6 UI, including discovery and approved folder setup."""
+"""Launch SyncBridge's PySide6 desktop with live local-file list refresh."""
 from __future__ import annotations
 
 import argparse
@@ -13,32 +13,28 @@ from syncbridge.network.share_activation import ACTIVATION_PORT
 from syncbridge.network.share_setup import SETUP_PORT
 from syncbridge.storage.config import ConfigStore
 from syncbridge.ui.desktop_controller import DesktopController
+from syncbridge.ui.qt_local_refresh import QtLocalFileRefresh
 from syncbridge.ui.qt_onboarding import NetworkOptions
 from syncbridge.ui.qt_window import SyncBridgeQtWindow
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="SyncBridge desktop"
-    )
+    parser = argparse.ArgumentParser(description="SyncBridge desktop")
+
     parser.add_argument("--profile", type=Path)
+    parser.add_argument("--bind-address", default="0.0.0.0")
+    parser.add_argument("--listen-ports", type=int, nargs=3)
+    parser.add_argument("--lock-port", type=int, default=45846)
+    parser.add_argument("--validation-port", type=int, default=45847)
+
     parser.add_argument(
-        "--bind-address", default="0.0.0.0"
+        "--discovery-port",
+        type=int,
+        default=DISCOVERY_PORT,
     )
     parser.add_argument(
-        "--listen-ports", type=int, nargs=3
-    )
-    parser.add_argument(
-        "--lock-port", type=int, default=45846
-    )
-    parser.add_argument(
-        "--validation-port", type=int, default=45847
-    )
-    parser.add_argument(
-        "--discovery-port", type=int, default=DISCOVERY_PORT
-    )
-    parser.add_argument(
-        "--discovery-bind", default="0.0.0.0"
+        "--discovery-bind",
+        default="0.0.0.0",
     )
     parser.add_argument("--discovery-name")
     parser.add_argument(
@@ -46,29 +42,41 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="IP:PORT",
     )
+
     parser.add_argument(
-        "--pairing-port", type=int, default=PAIRING_PORT
+        "--pairing-port",
+        type=int,
+        default=PAIRING_PORT,
     )
     parser.add_argument(
-        "--pairing-bind", default="0.0.0.0"
+        "--pairing-bind",
+        default="0.0.0.0",
     )
     parser.add_argument(
-        "--setup-port", type=int, default=SETUP_PORT
+        "--setup-port",
+        type=int,
+        default=SETUP_PORT,
     )
     parser.add_argument(
-        "--remote-setup-port", type=int, default=SETUP_PORT
+        "--remote-setup-port",
+        type=int,
+        default=SETUP_PORT,
     )
     parser.add_argument(
-        "--activation-port", type=int, default=ACTIVATION_PORT
+        "--activation-port",
+        type=int,
+        default=ACTIVATION_PORT,
     )
     parser.add_argument(
         "--remote-activation-port",
         type=int,
         default=ACTIVATION_PORT,
     )
+
     args = parser.parse_args(argv)
 
     targets = None
+
     if args.discovery_target:
         try:
             targets = tuple(
@@ -79,14 +87,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except ValueError as exc:
-            parser.error(
-                f"Invalid discovery target: {exc}"
-            )
+            parser.error(f"Invalid discovery target: {exc}")
 
     store = ConfigStore(
         args.profile / "settings.json"
         if args.profile else None
     )
+
     controller = DesktopController(
         store,
         bind_address=args.bind_address,
@@ -118,6 +125,11 @@ def main(argv: list[str] | None = None) -> int:
         controller,
         network_options=options,
     )
+
+    # Keep the receiving computer's visible file list up to date,
+    # without starting synchronization or scanning file contents.
+    window.local_view_refresh = QtLocalFileRefresh(window)
+
     window.show()
     return app.exec()
 
