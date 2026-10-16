@@ -1,212 +1,192 @@
 
-"""First PySide6 SyncBridge desktop: guarded manual sync for configured folders.
+"""Simple PySide6 SyncBridge desktop over the existing guarded sync engine.
 
-This runs alongside, rather than replacing, the Tkinter pairing/setup GUI.
-All blocking controller calls run on workers; Qt widgets remain on the UI thread.
+Pair, choose folders, browse each folder, preview differences, sync manually.
+Network work stays off the Qt thread and a visible Disconnect is disabled
+throughout active operations.
 """
 from __future__ import annotations
 
+import ipaddress
+import os
 import queue
+import socket
 import threading
 from pathlib import Path
 
 from PySide6.QtCore import QTimer, Qt, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices, QFont
 from PySide6.QtWidgets import (
-    QApplication,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QMenu,
-    QMessageBox,
-    QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
-    QHeaderView,
+    QApplication, QFrame, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QMessageBox, QPushButton, QTabWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from syncbridge.ui.desktop_controller import DesktopController, DesktopPreview
+from syncbridge.ui.qt_onboarding import NetworkOptions, QtOnboarding
 
 
 STYLE = """
-QMainWindow, QWidget#root {
+QWidget, QMainWindow {
     background: #f3f6fb;
     color: #17263c;
+    font: 10pt 'Segoe UI';
 }
-
 QLabel {
+    background: transparent;
     color: #17263c;
-    font-family: 'Segoe UI';
-    font-size: 10pt;
 }
-
 QLabel#brand {
     font-size: 22pt;
-    font-weight: 700;
+    font-weight: bold;
 }
-
 QLabel#heading {
     font-size: 12pt;
-    font-weight: 700;
+    font-weight: bold;
 }
-
 QLabel#muted {
-    color: #607087;
-    font-size: 9pt;
+    color: #586b83;
 }
-
 QLabel#status {
-    color: #215fba;
+    color: #1753a8;
     background: #e7f0ff;
-    border-radius: 12px;
-    padding: 8px 13px;
-    font-weight: 600;
+    padding: 8px 12px;
+    border-radius: 9px;
 }
-
 QFrame#card {
     background: white;
-    border: 1px solid #e1e7f0;
-    border-radius: 14px;
+    border: 1px solid #dfe7f1;
+    border-radius: 12px;
 }
-
+QFrame#card QLabel {
+    background: transparent;
+}
 QPushButton {
-    background: #ffffff;
+    background: white;
     color: #17263c;
-    border: 1px solid #d3dce9;
+    border: 1px solid #cbd8e8;
     border-radius: 8px;
-    padding: 10px 14px;
-    font-family: 'Segoe UI';
-    font-size: 10pt;
+    padding: 9px 14px;
 }
-
 QPushButton:hover {
     background: #eaf2ff;
     color: #124d9c;
 }
-
-QPushButton:pressed {
-    background: #dceafa;
-    color: #123e7d;
-}
-
 QPushButton:disabled {
-    color: #728198;
-    background: #f3f5f8;
-    border-color: #e1e6ef;
+    background: #f2f4f8;
+    color: #677992;
+    border-color: #e0e4eb;
 }
-
 QPushButton#primary {
     background: #236de0;
-    color: #ffffff;
+    color: white;
     border-color: #236de0;
-    font-weight: 600;
+    font-weight: bold;
 }
-
 QPushButton#primary:hover {
     background: #155bc3;
-    color: #ffffff;
+    color: white;
 }
-
-QPushButton#primary:pressed {
-    background: #114aa1;
-    color: #ffffff;
-}
-
 QPushButton#primary:disabled {
-    background: #b4c7e5;
-    border-color: #b4c7e5;
-    color: #ffffff;
+    background: #afc5e7;
+    border-color: #afc5e7;
+    color: white;
 }
-
+QTabWidget::pane {
+    background: white;
+    border: 1px solid #dde6f0;
+}
+QTabBar::tab {
+    background: #e9eef7;
+    color: #17263c;
+    padding: 10px 18px;
+}
+QTabBar::tab:selected {
+    background: white;
+    color: #145cbd;
+    font-weight: bold;
+}
 QTableWidget {
     background: white;
+    alternate-background-color: #f8faff;
     color: #17263c;
-    border: 1px solid #e0e6ee;
-    border-radius: 8px;
-    gridline-color: #edf1f7;
-    font-family: 'Segoe UI';
-    font-size: 9pt;
+    gridline-color: #ebeff6;
     selection-background-color: #dceafa;
     selection-color: #17263c;
 }
-
 QHeaderView::section {
     background: #f5f7fb;
-    color: #456079;
-    padding: 10px;
+    color: #344a64;
+    padding: 8px;
     border: none;
-    border-bottom: 1px solid #dce4ed;
-    font-weight: 600;
 }
-
-QMenu {
-    background: #ffffff;
-    color: #17263c;
-    border: 1px solid #d3dce9;
-    padding: 5px;
-    font-family: 'Segoe UI';
-    font-size: 10pt;
-}
-
-QMenu::item {
-    padding: 8px 20px;
+QDialog, QMessageBox {
+    background: white;
     color: #17263c;
 }
-
-QMenu::item:selected {
-    background: #e7f0ff;
-    color: #124d9c;
-}
-
-QMenu::item:disabled {
-    color: #728198;
-}
-
-/* Force readable colors for modal dialogs, even in Windows dark mode. */
-QMessageBox {
-    background-color: #ffffff;
+QDialog QLabel, QMessageBox QLabel, QDialog QCheckBox {
     color: #17263c;
+    background: transparent;
 }
-
-QMessageBox QLabel {
-    background-color: transparent;
-    color: #17263c;
-    font-family: 'Segoe UI';
-    font-size: 10pt;
-}
-
 QMessageBox QPushButton {
+    background: #f5f8ff;
     color: #17263c;
-    background-color: #f6f9ff;
-    border: 1px solid #cbd7e7;
-    border-radius: 7px;
-    padding: 8px 16px;
-    min-width: 64px;
+    min-width: 60px;
 }
-
-QMessageBox QPushButton:hover {
-    color: #124d9c;
-    background-color: #eaf2ff;
+QListWidget, QLineEdit {
+    background: white;
+    color: #17263c;
+    border: 1px solid #cbd8e8;
 }
-
-QMessageBox QPushButton:disabled {
-    color: #728198;
-    background-color: #f3f5f8;
+QListWidget::item:selected {
+    background: #dceafa;
+    color: #17263c;
 }
 """
 
 
-class SyncBridgeQtWindow(QMainWindow):
-    """A usable new UI for one already-approved share, without setup changes."""
+def local_address_for_peer(host: str) -> str:
+    """Use a real unicast listener address, never wildcard 0.0.0.0.
 
-    def __init__(self, controller: DesktopController) -> None:
+    A UDP route lookup sends no packet and works for LAN and virtual LAN peers.
+    """
+    target = ipaddress.IPv4Address(host)
+
+    if target.is_loopback:
+        return "127.0.0.1"
+
+    if target.is_unspecified or target.is_multicast:
+        raise ValueError(
+            "The other computer has an invalid network address"
+        )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.connect((str(target), 9))
+        address = probe.getsockname()[0]
+
+    actual = ipaddress.IPv4Address(address)
+    if (
+        actual.is_unspecified
+        or actual.is_loopback
+        or actual.is_multicast
+    ):
+        raise OSError(
+            "No usable local network address was found for this computer"
+        )
+
+    return address
+
+
+class SyncBridgeQtWindow(QMainWindow):
+    def __init__(
+        self,
+        controller: DesktopController,
+        *,
+        network_options: NetworkOptions | None = None,
+    ):
         super().__init__()
 
         self.setFont(QFont("Segoe UI", 10))
-
         self.controller = controller
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._busy = False
@@ -216,6 +196,19 @@ class SyncBridgeQtWindow(QMainWindow):
         self._configured = False
         self._preview: DesktopPreview | None = None
         self._worker: threading.Thread | None = None
+        self._paired_name = ""
+        self._loaded: set[str] = set()
+
+        self.onboarding = (
+            QtOnboarding(
+                self,
+                controller,
+                network_options,
+                self._paired,
+                self._folders_ready,
+            )
+            if network_options is not None else None
+        )
 
         self._make_ui()
         self._load_profile()
@@ -227,273 +220,252 @@ class SyncBridgeQtWindow(QMainWindow):
 
         QTimer.singleShot(150, self._auto_connect)
 
-    def _make_ui(self) -> None:
+        if self.onboarding:
+            QTimer.singleShot(50, self._start_network)
+
+    @staticmethod
+    def _label(text: str, kind: str = "") -> QLabel:
+        label = QLabel(text)
+        if kind:
+            label.setObjectName(kind)
+        label.setWordWrap(True)
+        return label
+
+    @staticmethod
+    def _table(headers: list[str]) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().hide()
+        table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        return table
+
+    def _make_ui(self):
         self.setWindowTitle("SyncBridge")
-        self.resize(1000, 690)
-        self.setMinimumSize(760, 510)
+        self.resize(1060, 720)
+        self.setMinimumSize(800, 560)
 
-        # Apply the light theme to the whole Qt application, including
-        # confirmation and warning dialogs created later.
         app = QApplication.instance()
-        if app is not None:
+        if app:
             app.setStyleSheet(STYLE)
-
         self.setStyleSheet(STYLE)
 
         root = QWidget()
-        root.setObjectName("root")
         self.setCentralWidget(root)
 
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(24, 22, 24, 18)
-        layout.setSpacing(15)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(12)
 
-        header = QHBoxLayout()
-        heading = QVBoxLayout()
-        heading.setSpacing(4)
+        title_row = QHBoxLayout()
+        title_row.addWidget(self._label("SyncBridge", "brand"))
+        title_row.addStretch()
+        self.status = self._label("Getting ready", "status")
+        title_row.addWidget(self.status)
+        layout.addLayout(title_row)
 
-        brand = QLabel("SyncBridge")
-        brand.setObjectName("brand")
-        heading.addWidget(brand)
-
-        heading.addWidget(
+        layout.addWidget(
             self._label(
-                "Simple, private file synchronization",
+                "Pair, choose folders, and keep your files together.",
                 "muted",
             )
         )
 
-        header.addLayout(heading)
-        header.addStretch()
+        card = QFrame()
+        card.setObjectName("card")
+        box = QVBoxLayout(card)
+        box.setContentsMargins(18, 14, 18, 14)
+        box.addWidget(self._label("YOUR CONNECTION", "heading"))
 
-        self.status = self._label("Getting ready", "status")
-        header.addWidget(
-            self.status,
-            alignment=Qt.AlignmentFlag.AlignTop,
+        self.connection = self._label(
+            "Find a computer to get started."
         )
-
-        layout.addLayout(header)
-
-        card = self._card()
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(20, 18, 20, 18)
-        card_layout.setSpacing(11)
-
-        card_layout.addWidget(
-            self._label(
-                "YOUR FOLDER CONNECTION",
-                "heading",
-            )
-        )
-
-        self.connection = QLabel(
-            "Checking this computer's folder..."
-        )
-        self.connection.setWordWrap(True)
-        card_layout.addWidget(self.connection)
+        box.addWidget(self.connection)
 
         self.hint = self._label("", "muted")
-        self.hint.setWordWrap(True)
-        card_layout.addWidget(self.hint)
+        box.addWidget(self.hint)
 
         controls = QHBoxLayout()
 
-        self.open_folder_button = QPushButton(
-            "Open my folder"
-        )
-        self.open_folder_button.clicked.connect(
-            self._open_folder
-        )
+        self.find_button = QPushButton("Find computer")
+        self.find_button.clicked.connect(self._find_computers)
+        controls.addWidget(self.find_button)
+
+        self.folder_select_button = QPushButton("Choose my folder")
+        self.folder_select_button.clicked.connect(self._choose_folder)
+        controls.addWidget(self.folder_select_button)
+
+        self.open_folder_button = QPushButton("Open my folder")
+        self.open_folder_button.clicked.connect(self._open_folder)
         controls.addWidget(self.open_folder_button)
 
         controls.addStretch()
 
-        self.options = QPushButton(
-            "Connection options  ▾"
-        )
+        self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.clicked.connect(self._toggle_connection)
+        controls.addWidget(self.disconnect_button)
 
-        menu = QMenu(self)
-        self.reconnect_action = menu.addAction(
-            "Reconnect"
-        )
-        self.disconnect_action = menu.addAction(
-            "Disconnect"
-        )
-
-        self.reconnect_action.triggered.connect(
-            self._connect
-        )
-        self.disconnect_action.triggered.connect(
-            self._disconnect
-        )
-
-        self.options.setMenu(menu)
-        controls.addWidget(self.options)
-
-        card_layout.addLayout(controls)
+        box.addLayout(controls)
         layout.addWidget(card)
 
-        changes = self._card()
-        changes_layout = QVBoxLayout(changes)
-        changes_layout.setContentsMargins(20, 18, 20, 18)
-        changes_layout.setSpacing(12)
+        changes_card = QFrame()
+        changes_card.setObjectName("card")
 
-        actions = QHBoxLayout()
-        titles = QVBoxLayout()
-        titles.setSpacing(4)
+        changes = QVBoxLayout(changes_card)
+        changes.setContentsMargins(18, 14, 18, 14)
 
-        titles.addWidget(
-            self._label(
-                "File changes",
-                "heading",
-            )
-        )
+        action_row = QHBoxLayout()
+        action_row.addWidget(self._label("YOUR FILES", "heading"))
+        action_row.addStretch()
 
-        titles.addWidget(
-            self._label(
-                "See what will change before syncing.",
-                "muted",
-            )
-        )
+        self.preview_button = QPushButton("Preview differences")
+        self.preview_button.clicked.connect(self._check_changes)
+        action_row.addWidget(self.preview_button)
 
-        actions.addLayout(titles)
-        actions.addStretch()
-
-        self.preview_button = QPushButton(
-            "Check changes"
-        )
-        self.preview_button.clicked.connect(
-            self._check_changes
-        )
-        actions.addWidget(self.preview_button)
-
-        self.sync_button = QPushButton(
-            "Sync files"
-        )
+        self.sync_button = QPushButton("Sync files")
         self.sync_button.setObjectName("primary")
-        self.sync_button.clicked.connect(
-            self._sync_files
+        self.sync_button.clicked.connect(self._sync_files)
+        action_row.addWidget(self.sync_button)
+
+        changes.addLayout(action_row)
+
+        self.summary = self._label(
+            "Connect folders to see your files."
         )
-        actions.addWidget(self.sync_button)
+        changes.addWidget(self.summary)
 
-        changes_layout.addLayout(actions)
+        self.tabs = QTabWidget()
 
-        self.summary = QLabel(
-            "Waiting for a folder connection."
+        self.local_table = self._table(
+            ["File on my computer", "Size"]
         )
-        self.summary.setWordWrap(True)
-        changes_layout.addWidget(self.summary)
-
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(
+        self.remote_table = self._table(
+            ["File on paired computer", "Size"]
+        )
+        self.table = self._table(
             ["Action", "File", "What happens"]
         )
 
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(
-            QTableWidget.EditTrigger.NoEditTriggers
+        self.tabs.addTab(self.local_table, "My files")
+        self.tabs.addTab(
+            self.remote_table, "Other computer's files"
         )
-        self.table.setSelectionBehavior(
-            QTableWidget.SelectionBehavior.SelectRows
-        )
-        self.table.setAlternatingRowColors(True)
+        self.tabs.addTab(self.table, "Differences")
+        self.tabs.currentChanged.connect(self._tab_changed)
 
-        self.table.horizontalHeader().setSectionResizeMode(
-            0,
-            QHeaderView.ResizeMode.ResizeToContents,
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            1,
-            QHeaderView.ResizeMode.Stretch,
-        )
-        self.table.horizontalHeader().setSectionResizeMode(
-            2,
-            QHeaderView.ResizeMode.Stretch,
-        )
-
-        changes_layout.addWidget(
-            self.table,
-            stretch=1,
-        )
-
-        layout.addWidget(changes, stretch=1)
+        changes.addWidget(self.tabs, stretch=1)
+        layout.addWidget(changes_card, stretch=1)
 
         self.progress = self._label("", "muted")
-        self.progress.setWordWrap(True)
         layout.addWidget(self.progress)
 
         layout.addWidget(
             self._label(
-                "Sync happens only when you approve it. "
-                "Conflicts and deletions need review.",
+                "Conflicts and deletions need review before changes are applied.",
                 "muted",
             )
         )
 
-    @staticmethod
-    def _label(value: str, kind: str) -> QLabel:
-        result = QLabel(value)
-        result.setObjectName(kind)
-        return result
-
-    @staticmethod
-    def _card() -> QFrame:
-        result = QFrame()
-        result.setObjectName("card")
-        return result
-
-    def _load_profile(self) -> None:
+    def _load_profile(self):
         try:
             profile = self.controller.profile()
         except Exception:
             self._configured = False
+            peer = (
+                self.onboarding.paired_device()
+                if self.onboarding and self.onboarding.started
+                else None
+            )
+            name = self._paired_name or (
+                peer.name if peer else ""
+            )
+
             self.connection.setText(
-                "No synchronized folder configured yet"
+                f"Paired with {name}. Choose my folder to continue."
+                if name else
+                "No paired computer yet. Select Find computer."
             )
             self.hint.setText(
-                "For now, pair computers and choose folders "
-                "in the existing SyncBridge desktop app. "
-                "This new interface handles an already-connected folder."
+                "Both people will choose a folder on their own computer."
             )
-            self.status.setText("Setup needed")
+            self.status.setText(
+                "Choose a folder" if name else "Not connected"
+            )
             return
 
         self._configured = True
+        peer = (
+            self.onboarding.paired_device()
+            if self.onboarding and self.onboarding.started
+            else None
+        )
+        name = self._paired_name or (
+            peer.name if peer else profile.remote_host
+        )
+
         self.connection.setText(
-            f"{profile.folder_name}  ·  {profile.device_name}\n"
-            f"My folder: {profile.local_root}\n"
-            f"Paired computer: {profile.remote_host}"
+            f"Connected with {name}  ·  {profile.folder_name}\n"
+            f"My folder: {profile.local_root}"
         )
         self.hint.setText(
-            "Your files stay on your two computers."
+            "Browse either folder below, or preview the differences."
         )
-        self.status.setText("Connecting...")
-
-    def _update_buttons(self) -> None:
-        ready = not self._busy and not self._closing
-        running = self.controller.running
-
-        self.preview_button.setEnabled(
-            ready and running
-        )
-        self.sync_button.setEnabled(
-            ready
-            and running
-            and self._preview is not None
-            and not self._preview.requires_review
-            and bool(self._preview.items)
-        )
-        self.open_folder_button.setEnabled(
-            ready and self._configured
-        )
-        self.reconnect_action.setEnabled(
-            ready and self._configured and not running
-        )
-        self.disconnect_action.setEnabled(
-            ready and running
+        self.status.setText(
+            "Connected" if self.controller.running else "Connecting..."
         )
 
-    def _auto_connect(self) -> None:
+    def _paired(self, name: str):
+        self._paired_name = name
+        self._load_profile()
+        self._update_buttons()
+
+    def _start_network(self):
+        if self._closing:
+            return
+        try:
+            self.onboarding.start()
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Nearby computers unavailable", str(exc)
+            )
+        self._load_profile()
+        self._update_buttons()
+
+    def _find_computers(self):
+        if self.onboarding:
+            self.onboarding.show_devices()
+
+    def _choose_folder(self):
+        if self.onboarding:
+            self.onboarding.choose_folder()
+
+    def _folders_ready(self):
+        self._loaded.clear()
+        self._load_profile()
+        self._update_buttons()
+        self._auto_connect()
+
+    def _prepare_listener(self):
+        """Work around wildcard binding rejected by lease validation.
+
+        This runs only before start(), when the runtime owns no listeners.
+        """
+        profile = self.controller.profile()
+        runtime = getattr(self.controller, "runtime", None)
+        if runtime is not None:
+            runtime.bind_address = local_address_for_peer(
+                profile.remote_host
+            )
+
+    def _auto_connect(self):
         if (
             self._configured
             and not self.controller.running
@@ -501,95 +473,118 @@ class SyncBridgeQtWindow(QMainWindow):
         ):
             self._connect()
 
-    def _work(self, name: str, callback) -> None:
+    def _update_buttons(self):
+        available = not self._busy and not self._closing
+        running = self.controller.running
+        paired = bool(
+            self._paired_name
+            or (
+                self.onboarding
+                and self.onboarding.started
+                and self.onboarding.paired_device()
+            )
+        )
+
+        self.find_button.setEnabled(
+            not self._closing
+            and self.onboarding is not None
+            and self.onboarding.started
+        )
+        self.folder_select_button.setEnabled(
+            available and paired and not self._configured
+        )
+        self.open_folder_button.setEnabled(
+            available and self._configured
+        )
+        self.preview_button.setEnabled(
+            available and running
+        )
+        self.sync_button.setEnabled(
+            available
+            and running
+            and self._preview is not None
+            and not self._preview.requires_review
+            and bool(self._preview.items)
+        )
+        self.disconnect_button.setEnabled(
+            available and self._configured
+        )
+        self.disconnect_button.setText(
+            "Disconnect" if running else "Reconnect"
+        )
+
+    def _work(self, kind: str, action):
         if self._busy or self._closing:
             return
 
         self._busy = True
+        self._update_buttons()
         self.status.setText(
             {
                 "connect": "Connecting...",
-                "preview": "Checking files...",
-                "sync": "Synchronizing...",
                 "stop": "Disconnecting...",
-            }[name]
+                "preview": "Checking differences...",
+                "sync": "Synchronizing...",
+                "local": "Loading files...",
+                "remote": "Loading files...",
+            }[kind]
         )
-        self._update_buttons()
 
-        def runner() -> None:
+        def runner():
             try:
-                result = callback()
+                result = action()
             except Exception as exc:
-                self._events.put(
-                    ("error", (name, exc))
-                )
+                self._events.put(("error", (kind, exc)))
             else:
-                self._events.put(
-                    ("done", (name, result))
-                )
+                self._events.put(("done", (kind, result)))
 
         self._worker = threading.Thread(
             target=runner,
-            name=f"SyncBridgeQt-{name}",
+            name=f"SyncBridgeQt-{kind}",
             daemon=False,
         )
         self._worker.start()
 
-    def _connect(self) -> None:
+    def _connect(self):
         if self._configured:
-            self._work(
-                "connect",
-                self.controller.start,
-            )
+            def connect():
+                self._prepare_listener()
+                return self.controller.start()
 
-    def _disconnect(self) -> None:
-        self._preview = None
-        self.table.setRowCount(0)
-        self._work(
-            "stop",
-            self.controller.stop,
-        )
+            self._work("connect", connect)
 
-    def _check_changes(self) -> None:
+    def _toggle_connection(self):
+        if self.controller.running:
+            self._preview = None
+            self.table.setRowCount(0)
+            self._work("stop", self.controller.stop)
+        elif self._configured:
+            self._connect()
+
+    def _check_changes(self):
         self._preview = None
         self._update_buttons()
         self._work(
-            "preview",
-            self.controller.preview,
+            "preview", self.controller.preview
         )
 
-    def _sync_files(self) -> None:
+    def _sync_files(self):
         plan = self._preview
 
-        if (
-            plan is None
-            or plan.requires_review
-            or not plan.items
-        ):
+        if plan is None or plan.requires_review or not plan.items:
             return
 
         count = len(plan.items)
-
-        warning = (
-            "\n\nThis is a large change list. "
-            "Transfers may take time."
-            if count >= 50
-            else ""
-        )
-
         answer = QMessageBox.question(
             self,
-            "Synchronize these files?",
-            f"{count} planned file change(s).\n\n"
-            "Files may be sent or received in either direction."
-            f"{warning}\n\n"
-            "Conflicts and deletions will not be applied automatically."
-            "\n\nContinue?",
+            "Sync these files?",
+            f"{count} planned change(s). Files may be sent or received.\n\n"
+            "Conflicts and deletions are not automatically applied.\n\n"
+            "Continue?",
             QMessageBox.StandardButton.Yes
             | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-
         if answer != QMessageBox.StandardButton.Yes:
             return
 
@@ -603,45 +598,165 @@ class SyncBridgeQtWindow(QMainWindow):
             ),
         )
 
-    def _on_progress(self, event: object) -> None:
-        self._events.put(
-            ("progress", event)
-        )
+    def _on_progress(self, item):
+        self._events.put(("progress", item))
 
-    def _open_folder(self) -> None:
+    def _open_folder(self):
         try:
-            folder = Path(
+            root = Path(
                 self.controller.profile().local_root
             ).resolve(strict=True)
 
             if (
-                not folder.is_dir()
+                not root.is_dir()
                 or not QDesktopServices.openUrl(
-                    QUrl.fromLocalFile(str(folder))
+                    QUrl.fromLocalFile(str(root))
                 )
             ):
-                raise OSError(
-                    "Could not open the folder"
-                )
+                raise OSError("Could not open folder")
 
         except Exception as exc:
             QMessageBox.warning(
-                self,
-                "Cannot open folder",
-                str(exc),
+                self, "Cannot open folder", str(exc)
             )
 
-    def _display_plan(
-        self,
-        plan: DesktopPreview,
-    ) -> None:
-        self._preview = plan
-        self.table.setRowCount(
-            len(plan.items)
+    @staticmethod
+    def _list_local(root: Path):
+        """Fast, metadata-only browse; avoid hashing a 100 GB folder for display."""
+        rows = []
+
+        for parent, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [
+                d for d in dirs
+                if d not in {
+                    ".git", ".venv", "__pycache__", ".syncbridge"
+                }
+                and not (Path(parent) / d).is_symlink()
+            ]
+
+            for filename in files:
+                if filename in {
+                    ".git", ".venv", "__pycache__", ".syncbridge"
+                }:
+                    continue
+
+                path = Path(parent) / filename
+                if path.is_symlink():
+                    continue
+
+                try:
+                    rows.append(
+                        (
+                            path.relative_to(root).as_posix(),
+                            path.stat().st_size,
+                        )
+                    )
+                except (OSError, ValueError):
+                    continue
+
+                if len(rows) >= 3000:
+                    return rows, True
+
+        return rows, False
+
+    def _list_remote(self):
+        config = self.controller.store.load()
+        share = next(
+            s for s in config.shares if s.enabled
+        )
+        client = self.controller.runtime.manifest_client
+
+        if client is None:
+            raise RuntimeError("The connection is not ready")
+
+        manifest = client.fetch(
+            share.remote_host,
+            share.manifest_port,
+            share.peer_node_id,
+            share.share_id,
         )
 
-        for row, item in enumerate(plan.items):
-            for col, value in enumerate(
+        records = manifest.snapshot.files
+        rows = [
+            (item.relative_path, item.size)
+            for item in records.values()
+        ]
+        return rows[:3000], len(rows) > 3000
+
+    def _tab_changed(self, index: int):
+        if (
+            not self.controller.running
+            or self._busy
+            or self._closing
+        ):
+            return
+
+        kind = (
+            "local" if index == 0
+            else "remote" if index == 1
+            else None
+        )
+
+        if kind is None or kind in self._loaded:
+            return
+
+        self.summary.setText(
+            "Loading file names. Large folders may take a while..."
+        )
+
+        if kind == "local":
+            root = Path(
+                self.controller.profile().local_root
+            )
+            self._work(
+                kind,
+                lambda: self._list_local(root),
+            )
+        else:
+            self._work(kind, self._list_remote)
+
+    @staticmethod
+    def _size(value: int) -> str:
+        if value < 1024:
+            return f"{value} B"
+
+        for unit in ("KB", "MB", "GB", "TB"):
+            value /= 1024
+            if value < 1024:
+                return f"{value:.1f} {unit}"
+
+        return f"{value:.1f} PB"
+
+    def _display_files(self, kind: str, result):
+        rows, truncated = result
+        target = (
+            self.local_table
+            if kind == "local"
+            else self.remote_table
+        )
+
+        target.setRowCount(len(rows))
+        for i, (path, size) in enumerate(rows):
+            target.setItem(
+                i, 0, QTableWidgetItem(str(path))
+            )
+            target.setItem(
+                i, 1, QTableWidgetItem(self._size(size))
+            )
+
+        self._loaded.add(kind)
+        self.summary.setText(
+            f"Showing {len(rows)} file(s)"
+            + (" (first 3,000 only)" if truncated else "")
+        )
+        self.status.setText("Connected")
+
+    def _display_plan(self, plan: DesktopPreview):
+        self._preview = plan
+        self.table.setRowCount(len(plan.items))
+
+        for i, item in enumerate(plan.items):
+            for j, value in enumerate(
                 (
                     item.action,
                     item.path,
@@ -649,16 +764,15 @@ class SyncBridgeQtWindow(QMainWindow):
                 )
             ):
                 self.table.setItem(
-                    row,
-                    col,
-                    QTableWidgetItem(str(value)),
+                    i, j, QTableWidgetItem(str(value))
                 )
+
+        self.tabs.setCurrentIndex(2)
 
         if plan.requires_review:
             self.summary.setText(
-                f"{len(plan.items)} change(s) found. "
-                "Conflicts or deletions need review "
-                "before SyncBridge can continue."
+                f"{len(plan.items)} difference(s). "
+                "Conflicts or deletions need review."
             )
         elif not plan.items:
             self.summary.setText(
@@ -666,53 +780,60 @@ class SyncBridgeQtWindow(QMainWindow):
             )
         else:
             self.summary.setText(
-                f"{len(plan.items)} change(s) found. "
-                "Review the list, then choose Sync files."
+                f"{len(plan.items)} difference(s). "
+                "Review, then choose Sync files."
             )
 
         self.status.setText("Changes checked")
 
-    def _finish(
-        self,
-        name: str,
-        result: object,
-    ) -> None:
-        if name == "connect":
+    def _finish(self, kind: str, result):
+        if kind == "connect":
             self.status.setText("Connected")
             self.summary.setText(
-                "Connected. Check changes whenever you're ready."
+                "Connected. Browse the folders or preview differences."
             )
+            self._tab_changed(self.tabs.currentIndex())
 
-        elif name == "stop":
+        elif kind == "stop":
             self.status.setText("Disconnected")
             self.summary.setText(
-                "Connection stopped."
+                "Connection paused. Select Reconnect when ready."
             )
 
-        elif name == "preview":
+        elif kind == "preview":
             self._display_plan(result)
 
-        elif name == "sync":
-            if result.complete:
-                self.status.setText("Synchronized")
-                self.summary.setText(
-                    f"Finished. Sent {len(result.uploaded)} file(s) "
-                    f"and received {len(result.downloaded)} file(s). "
-                    "Check changes again to see the latest state."
+        elif kind == "sync":
+            self.status.setText(
+                "Synchronized" if result.complete else "Needs attention"
+            )
+            self.summary.setText(
+                (
+                    f"Sent {len(result.uploaded)}, "
+                    f"received {len(result.downloaded)} file(s). "
+                    "Preview again to see remaining differences."
                 )
-            else:
-                self.status.setText("Needs attention")
-                self.summary.setText(
-                    "Synchronization paused safely. "
-                    "Check changes before retrying."
-                )
-
+                if result.complete else
+                "Synchronization paused. Preview again before retrying."
+            )
+            self._loaded.clear()
             self.progress.setText("")
 
-    def _drain(self) -> None:
+        elif kind in ("local", "remote"):
+            self._display_files(kind, result)
+
+    def _drain(self):
+        if self.onboarding and not self._closing:
+            try:
+                self.onboarding.poll()
+            except Exception as exc:
+                self.progress.setText(
+                    f"Nearby connection issue: {exc}"
+                )
+
         for _ in range(100):
             try:
-                kind, payload = self._events.get_nowait()
+                kind, value = self._events.get_nowait()
             except queue.Empty:
                 break
 
@@ -720,29 +841,38 @@ class SyncBridgeQtWindow(QMainWindow):
                 if kind == "progress":
                     if not self._closing:
                         self.progress.setText(
-                            f"{payload.direction}: "
-                            f"{payload.path} "
-                            f"({payload.transferred:,}/"
-                            f"{payload.total:,} bytes)"
+                            f"{value.direction}: {value.path} "
+                            f"({self._size(value.transferred)} "
+                            f"/ {self._size(value.total)})"
                         )
 
                 elif kind == "done":
                     self._busy = False
                     if not self._closing:
-                        self._finish(*payload)
+                        self._finish(*value)
 
                 elif kind == "error":
                     self._busy = False
                     if not self._closing:
-                        name, error = payload
+                        action, exc = value
                         self.status.setText("Needs attention")
-                        self.summary.setText(
-                            f"Could not complete {name}: {error}"
-                        )
+
+                        if (
+                            "Cannot reach manifest service" in str(exc)
+                            or "10061" in str(exc)
+                        ):
+                            message = (
+                                "The other computer is not ready yet. "
+                                "Check that SyncBridge is open there, then retry."
+                            )
+                        else:
+                            message = (
+                                f"Could not {action}: {exc}"
+                            )
+
+                        self.summary.setText(message)
                         QMessageBox.warning(
-                            self,
-                            "SyncBridge",
-                            str(error),
+                            self, "SyncBridge", message
                         )
 
                 elif kind == "shutdown-ok":
@@ -757,16 +887,14 @@ class SyncBridgeQtWindow(QMainWindow):
                     QMessageBox.warning(
                         self,
                         "Shutdown issue",
-                        str(payload),
+                        str(value),
                     )
 
             except Exception as exc:
                 self._busy = False
                 self._preview = None
-                self.status.setText("Needs attention")
                 self.summary.setText(
-                    "Couldn't display an operation result: "
-                    f"{exc}"
+                    f"Unable to display result: {exc}"
                 )
 
             self._update_buttons()
@@ -778,33 +906,39 @@ class SyncBridgeQtWindow(QMainWindow):
         ):
             self._shutdown()
 
-    def _shutdown(self) -> None:
+    def _shutdown(self):
         self._shutting_down = True
         self.status.setText("Closing...")
 
-        def runner() -> None:
+        def worker():
+            problems = []
+
+            if self.onboarding:
+                try:
+                    self.onboarding.stop()
+                except Exception as exc:
+                    problems.append(str(exc))
+
             try:
                 self.controller.stop()
             except Exception as exc:
-                self._events.put(
-                    ("shutdown-error", exc)
+                problems.append(str(exc))
+
+            self._events.put(
+                (
+                    "shutdown-error" if problems else "shutdown-ok",
+                    "; ".join(problems) if problems else None,
                 )
-            else:
-                self._events.put(
-                    ("shutdown-ok", None)
-                )
+            )
 
         self._worker = threading.Thread(
-            target=runner,
+            target=worker,
             name="SyncBridgeQt-Shutdown",
             daemon=False,
         )
         self._worker.start()
 
-    def closeEvent(
-        self,
-        event: QCloseEvent,
-    ) -> None:
+    def closeEvent(self, event: QCloseEvent):
         if self._allow_close:
             self._timer.stop()
             event.accept()
@@ -814,10 +948,11 @@ class SyncBridgeQtWindow(QMainWindow):
 
         if not self._closing:
             self._closing = True
+
+            if self.onboarding:
+                self.onboarding.close_ui()
+
             self.status.setText("Closing...")
-            self.summary.setText(
-                "Finishing the current operation before closing."
-            )
             self._update_buttons()
 
             if not self._busy:
