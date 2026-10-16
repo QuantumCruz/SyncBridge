@@ -1,9 +1,9 @@
 
-"""Headless adapter for the first SyncBridge desktop window.
+"""Headless adapter for SyncBridge's manual desktop synchronization UI.
 
-This adapter never pairs devices or silently enables background sync.
-The selected profile must already contain one trusted, enabled share.
-Only GuardedManualRuntime is allowed to perform file-changing syncs.
+The selected profile must contain one trusted enabled share. This controller
+never pairs devices or silently enables file changes. GuardedManualRuntime
+remains the only authority permitted to modify files.
 """
 from __future__ import annotations
 
@@ -35,6 +35,10 @@ class DesktopPlanItem:
     action: str
     description: str
     needs_review: bool
+
+    # Optional for compatibility with existing tests and callers.
+    # This is a read-only estimate from the preview inventory.
+    size: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,25 +78,37 @@ _ACTIONS = {
 
 
 def describe_preview(result) -> DesktopPreview:
-    """Convert real lifecycle decisions to presentation data, with no writes."""
+    """Convert real lifecycle decisions to safe, read-only UI data."""
     preview = result.preview
     items = []
 
     for decision in preview.plan.decisions:
         title, explanation, blocked = _ACTIONS[decision.action]
+
+        source = (
+            getattr(decision, "local", None)
+            if decision.action is SyncAction.UPLOAD
+            else getattr(decision, "remote", None)
+            if decision.action is SyncAction.DOWNLOAD
+            else None
+        )
+
         items.append(
             DesktopPlanItem(
                 decision.path,
                 title,
                 explanation,
                 blocked,
+                size=getattr(source, "size", None),
             )
         )
 
     return DesktopPreview(
         revision=preview.baseline_revision,
         items=tuple(items),
-        requires_review=any(item.needs_review for item in items),
+        requires_review=any(
+            item.needs_review for item in items
+        ),
     )
 
 
@@ -109,10 +125,14 @@ class DesktopController:
         validation_port: int = 45847,
         runtime_factory: Callable[..., object] = GuardedManualRuntime,
     ) -> None:
-        self.store = store if store is not None else ConfigStore()
+        self.store = (
+            store if store is not None else ConfigStore()
+        )
 
         if not isinstance(self.store, ConfigStore):
-            raise TypeError("store must be a ConfigStore")
+            raise TypeError(
+                "store must be a ConfigStore"
+            )
 
         self._started = False
 
@@ -126,13 +146,13 @@ class DesktopController:
 
     @property
     def running(self) -> bool:
-        # Do not call runtime.status from Tk's thread. The runtime holds
-        # its internal lock for the entire sync cycle, so that could
-        # otherwise freeze the window.
+        # runtime.status holds a lock for the whole sync cycle.
+        # Accessing it on the UI thread can freeze the desktop.
         return self._started
 
     def profile(self) -> DesktopProfile:
         settings = self.store.load()
+
         enabled = [
             share
             for share in settings.shares
@@ -170,8 +190,6 @@ class DesktopController:
         if self._started:
             return
 
-        # Reject incomplete or automatic-write configuration before
-        # opening any network listeners.
         self.profile()
         self.runtime.start(background=False)
         self._started = True

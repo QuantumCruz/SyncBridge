@@ -15,18 +15,34 @@ from syncbridge.storage.config import ConfigStore
 from syncbridge.ui.desktop_controller import DesktopController
 from syncbridge.ui.qt_local_refresh import QtLocalFileRefresh
 from syncbridge.ui.qt_onboarding import NetworkOptions
-from syncbridge.ui.qt_window import SyncBridgeQtWindow
+from syncbridge.ui.qt_progress_window import SyncBridgeProgressWindow
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="SyncBridge desktop")
+    parser = argparse.ArgumentParser(
+        description="SyncBridge desktop"
+    )
 
     parser.add_argument("--profile", type=Path)
-    parser.add_argument("--bind-address", default="0.0.0.0")
-    parser.add_argument("--listen-ports", type=int, nargs=3)
-    parser.add_argument("--lock-port", type=int, default=45846)
-    parser.add_argument("--validation-port", type=int, default=45847)
-
+    parser.add_argument(
+        "--bind-address",
+        default="0.0.0.0",
+    )
+    parser.add_argument(
+        "--listen-ports",
+        type=int,
+        nargs=3,
+    )
+    parser.add_argument(
+        "--lock-port",
+        type=int,
+        default=45846,
+    )
+    parser.add_argument(
+        "--validation-port",
+        type=int,
+        default=45847,
+    )
     parser.add_argument(
         "--discovery-port",
         type=int,
@@ -42,7 +58,6 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         metavar="IP:PORT",
     )
-
     parser.add_argument(
         "--pairing-port",
         type=int,
@@ -87,7 +102,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
         except ValueError as exc:
-            parser.error(f"Invalid discovery target: {exc}")
+            parser.error(
+                f"Invalid discovery target: {exc}"
+            )
 
     store = ConfigStore(
         args.profile / "settings.json"
@@ -121,14 +138,14 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("SyncBridge")
 
-    window = SyncBridgeQtWindow(
+    window = SyncBridgeProgressWindow(
         controller,
         network_options=options,
     )
 
-    # Keep the receiving computer's visible file list up to date,
-    # without starting synchronization or scanning file contents.
-    window.local_view_refresh = QtLocalFileRefresh(window)
+    window.local_view_refresh = QtLocalFileRefresh(
+        window
+    )
 
     window.show()
     return app.exec()
