@@ -245,9 +245,16 @@ class PeerManager:
             daemon=True,
             name=f"SyncBridge-{target.__name__}",
         )
+
+        # Register and start atomically relative to stop().
+        # Otherwise stop() can try to join a thread before it starts.
         with self._lock:
             self._threads.add(thread)
-        thread.start()
+            try:
+                thread.start()
+            except BaseException:
+                self._threads.discard(thread)
+                raise
 
     def start(self) -> None:
         with self._lock:
