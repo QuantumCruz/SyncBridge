@@ -1,10 +1,8 @@
 
-"""Simple SyncBridge Qt desktop using the tested guarded synchronization engine.
+"""SyncBridge Qt desktop: discover, pair, choose folders and sync manually.
 
-Background file operations never touch Qt widgets. Unknown-duration operations
-show an indeterminate bar; transfer callbacks show progress for ONE file only.
-Disconnect stops the current runtime and requires selecting a computer again.
-It does not erase either computer's share or grant permissions to a new peer.
+Computer switching requires stopping the old runtime and explicit consent to
+remove its LOCAL saved folder relationship. Files, identity and trust remain.
 """
 from __future__ import annotations
 
@@ -23,6 +21,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from syncbridge.ui.connection_switch import forget_local_folder_connection
 from syncbridge.ui.desktop_controller import DesktopController, DesktopPreview
 from syncbridge.ui.qt_onboarding import NetworkOptions, QtOnboarding
 
@@ -106,7 +105,6 @@ class SyncBridgeQtWindow(QMainWindow):
         self._render_rows: list[tuple[str, int]] = []
         self._render_offset = 0
         self._render_truncated = False
-
         self.onboarding = (
             QtOnboarding(self, controller, network_options, self._paired, self._folders_ready)
             if network_options is not None else None
@@ -153,7 +151,6 @@ class SyncBridgeQtWindow(QMainWindow):
         layout = QVBoxLayout(root)
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(12)
-
         title_row = QHBoxLayout()
         title_row.addWidget(self._label("SyncBridge", "brand"))
         title_row.addStretch()
@@ -163,7 +160,6 @@ class SyncBridgeQtWindow(QMainWindow):
         layout.addWidget(self._label(
             "Pair, choose folders, and keep your files together.", "muted"
         ))
-
         card = QFrame()
         card.setObjectName("card")
         box = QVBoxLayout(card)
@@ -189,12 +185,10 @@ class SyncBridgeQtWindow(QMainWindow):
         controls.addWidget(self.disconnect_button)
         box.addLayout(controls)
         layout.addWidget(card)
-
         changes_card = QFrame()
         changes_card.setObjectName("card")
         changes = QVBoxLayout(changes_card)
         changes.setContentsMargins(18, 14, 18, 14)
-
         action_row = QHBoxLayout()
         action_row.addWidget(self._label("YOUR FILES", "heading"))
         action_row.addStretch()
@@ -208,7 +202,6 @@ class SyncBridgeQtWindow(QMainWindow):
         changes.addLayout(action_row)
         self.summary = self._label("Connect folders to see your files.")
         changes.addWidget(self.summary)
-
         self.tabs = QTabWidget()
         self.local_table = self._table(["File on my computer", "Size"])
         self.remote_table = self._table(["File on paired computer", "Size"])
@@ -219,7 +212,6 @@ class SyncBridgeQtWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._tab_changed)
         changes.addWidget(self.tabs, stretch=1)
         layout.addWidget(changes_card, stretch=1)
-
         self.activity_label = self._label("", "muted")
         layout.addWidget(self.activity_label)
         self.activity_bar = QProgressBar()
@@ -252,7 +244,6 @@ class SyncBridgeQtWindow(QMainWindow):
         self.activity_label.hide()
 
     def _onboarding_activity(self) -> None:
-        """Reflect slow approval stages without blocking any window controls."""
         if self._busy or self._closing or self.onboarding is None or not self.onboarding.started:
             return
         if self.onboarding._pair_busy:
@@ -287,7 +278,7 @@ class SyncBridgeQtWindow(QMainWindow):
         if self._paused:
             self.connection.setText(
                 f"Disconnected from {profile.remote_host} · {profile.folder_name}\n"
-                "Select Find computer to reconnect to this saved folder."
+                "Select Find computer to reconnect or switch computers."
             )
             self.hint.setText("Files and pairing have been kept; no files were deleted.")
             self.status.setText("Disconnected")
@@ -305,24 +296,70 @@ class SyncBridgeQtWindow(QMainWindow):
         self.status.setText("Connected" if self.controller.running else "Connecting...")
 
     def _paired(self, name: str) -> None:
-        """A saved relationship resumes only after choosing that computer again."""
-        if self._configured and self._paused:
-            selected = self.onboarding.current_peer if self.onboarding else None
-            saved = next((s for s in self.controller.store.load().shares if s.enabled), None)
-            if selected is None or saved is None or selected.node_id != saved.peer_node_id:
+        """Selecting a new peer after Disconnect requires replacing the old LOCAL share."""
+        selected = self.onboarding.current_peer if self.onboarding else None
+        existing = self.controller.store.load().shares
+        saved = existing[0] if len(existing) == 1 else None
+
+        if self._configured and selected is not None and saved is not None:
+            if selected.node_id != saved.peer_node_id:
+                if not self._paused or self.controller.running or self._busy:
+                    QMessageBox.information(
+                        self, "Disconnect first",
+                        "Disconnect from your current computer before choosing another."
+                    )
+                    return
+                confirmed = QMessageBox.question(
+                    self,
+                    "Switch computers?",
+                    "Switching will remove the old folder connection from THIS computer.\n\n"
+                    "Your files will stay exactly where they are, and the devices will remain paired.\n\n"
+                    "The other computer keeps its own saved connection until its owner changes it.\n\n"
+                    f"Continue with {name}?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if confirmed != QMessageBox.StandardButton.Yes:
+                    return
+                try:
+                    forget_local_folder_connection(
+                        self.controller.store,
+                        expected_share_id=saved.share_id,
+                        running=self.controller.running,
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(self, "Could not switch", str(exc))
+                    return
+                self._paused = False
+                self._preview = None
+                self._loaded.clear()
+                self.table.setRowCount(0)
+                self.local_table.setRowCount(0)
+                self.remote_table.setRowCount(0)
+                self.summary.setText("Both people can now choose their folders.")
+                self._paired_name = name
+                self._load_profile()
+                self._update_buttons()
+                return
+
+            if self._paused:
+                self._paused = False
+                self._paired_name = name
+                self._load_profile()
+                self._update_buttons()
+                self._auto_connect()
+                return
+
+        # Never display a different computer as connected while a relationship
+        # with another peer is still saved (including multiple-share profiles).
+        if self._configured and selected is not None:
+            if len(existing) != 1 or existing[0].peer_node_id != selected.node_id:
                 QMessageBox.information(
-                    self, "Different computer",
-                    "This folder is still linked to another computer. "
-                    "Switching folder partners isn't supported safely yet. "
-                    "Your files and saved connection have not changed.",
+                    self, "Existing connection",
+                    "Disconnect before changing the saved folder connection."
                 )
                 return
-            self._paused = False
-            self._paired_name = name
-            self._load_profile()
-            self._update_buttons()
-            self._auto_connect()
-            return
+
         self._paired_name = name
         self._load_profile()
         self._update_buttons()
@@ -362,7 +399,12 @@ class SyncBridgeQtWindow(QMainWindow):
             self._connect()
 
     def _update_buttons(self) -> None:
-        available = not self._busy and not self._closing
+        onboarding_busy = bool(
+            self.onboarding and (
+                self.onboarding._pair_busy or self.onboarding._folder_busy
+            )
+        )
+        available = not self._busy and not self._closing and not onboarding_busy
         running = self.controller.running
         paired = bool(
             self._paired_name or (
@@ -370,8 +412,10 @@ class SyncBridgeQtWindow(QMainWindow):
                 and self.onboarding.paired_device()
             )
         )
+        # A running session must be disconnected before choosing a new peer.
         self.find_button.setEnabled(
-            available and self.onboarding is not None and self.onboarding.started
+            available and not running
+            and self.onboarding is not None and self.onboarding.started
         )
         self.folder_select_button.setEnabled(
             available and not self._paused and paired and not self._configured
@@ -423,7 +467,6 @@ class SyncBridgeQtWindow(QMainWindow):
             self._work("connect", connect)
 
     def _toggle_connection(self) -> None:
-        """Stop sync and return to computer picker; do not erase folder grants."""
         if not self.controller.running or self._busy:
             return
         self._paused = True
@@ -523,7 +566,6 @@ class SyncBridgeQtWindow(QMainWindow):
         return f"{value:.1f} PB"
 
     def _display_files(self, kind: str, result) -> None:
-        """Render large listings in batches to keep the event loop responsive."""
         rows, truncated = result
         self._render_kind = kind
         self._render_rows = list(rows)
@@ -643,6 +685,11 @@ class SyncBridgeQtWindow(QMainWindow):
                     if not self._closing:
                         self._hide_activity()
                         action, exc = value
+                        if action == "stop":
+                            # A failed stop must not masquerade as a safe
+                            # disconnection or enable changing partners.
+                            self._paused = False
+                            self._load_profile()
                         self.status.setText("Needs attention")
                         message = (
                             "The other computer isn't ready. Keep SyncBridge open "
@@ -709,8 +756,6 @@ class SyncBridgeQtWindow(QMainWindow):
         event.ignore()
         if not self._closing:
             self._closing = True
-            # Table rendering is a UI-only task and can be cancelled at once.
-            # Otherwise a pending batch would leave _busy=True forever.
             if self._render_kind is not None:
                 self._render_kind = None
                 self._render_rows = []
