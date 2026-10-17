@@ -13,7 +13,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-
 from syncbridge.core.lifecycle import LifecycleStatus, SyncLifecycle
 from syncbridge.core.sync_service import AutoSyncService, ServiceState
 
@@ -50,9 +49,11 @@ def make(tmp_path, method=None, **options):
 
 def test_default_mode_is_read_only_and_runs_immediately(tmp_path):
     calls = []
+
     def cycle(**kwargs):
         calls.append(kwargs)
         return outcome()
+
     service, _ = make(tmp_path, cycle, poll_interval=30)
     try:
         service.start()
@@ -67,8 +68,15 @@ def test_default_mode_is_read_only_and_runs_immediately(tmp_path):
 
 def test_opt_in_apply_mode(tmp_path):
     calls = []
-    service, _ = make(tmp_path, lambda **kw: (calls.append(kw), outcome(LifecycleStatus.COMMITTED))[1],
-                      auto_apply=True, poll_interval=30)
+    service, _ = make(
+        tmp_path,
+        lambda **kw: (
+            calls.append(kw),
+            outcome(LifecycleStatus.COMMITTED),
+        )[1],
+        auto_apply=True,
+        poll_interval=30,
+    )
     try:
         service.start()
         until(lambda: len(calls) == 1)
@@ -79,8 +87,11 @@ def test_opt_in_apply_mode(tmp_path):
 
 def test_periodic_poll_detects_remote_only_changes(tmp_path):
     runs = []
-    service, _ = make(tmp_path, lambda **_: (runs.append(time.monotonic()), outcome())[1],
-                      poll_interval=0.05)
+    service, _ = make(
+        tmp_path,
+        lambda **_: (runs.append(time.monotonic()), outcome())[1],
+        poll_interval=0.05,
+    )
     try:
         service.start()
         until(lambda: len(runs) >= 3)
@@ -91,7 +102,11 @@ def test_periodic_poll_detects_remote_only_changes(tmp_path):
 
 def test_manual_request_wakes_early(tmp_path):
     runs = []
-    service, _ = make(tmp_path, lambda **_: (runs.append(1), outcome())[1], poll_interval=30)
+    service, _ = make(
+        tmp_path,
+        lambda **_: (runs.append(1), outcome())[1],
+        poll_interval=30,
+    )
     try:
         service.start()
         until(lambda: len(runs) == 1)
@@ -103,7 +118,9 @@ def test_manual_request_wakes_early(tmp_path):
 
 def test_local_watcher_wakes_and_debounces(tmp_path, monkeypatch):
     from syncbridge.core import sync_service as module
+
     instances = []
+
     class FakeWatcher:
         def __init__(self, root, on_change, *, interval, on_error):
             self.on_change = on_change
@@ -112,16 +129,25 @@ def test_local_watcher_wakes_and_debounces(tmp_path, monkeypatch):
             self.started = False
             self.stopped = False
             instances.append(self)
+
         def poll_once(self):
             self.polls += 1
+
         def start(self):
             self.started = True
+
         def stop(self):
             self.stopped = True
+
     monkeypatch.setattr(module, "FileWatcher", FakeWatcher)
     runs = []
-    service, _ = make(tmp_path, lambda **_: (runs.append(time.monotonic()), outcome())[1],
-                      watch_local=True, poll_interval=30, settle_delay=0.10)
+    service, _ = make(
+        tmp_path,
+        lambda **_: (runs.append(time.monotonic()), outcome())[1],
+        watch_local=True,
+        poll_interval=30,
+        settle_delay=0.10,
+    )
     try:
         service.start()
         until(lambda: len(runs) == 1)
@@ -136,19 +162,28 @@ def test_local_watcher_wakes_and_debounces(tmp_path, monkeypatch):
 
 
 def test_transient_failures_back_off_and_recover(tmp_path):
+    """Verify retry intervals with a high-resolution elapsed-time clock."""
     runs = []
     errors = []
+
     def cycle(**_):
-        runs.append(time.monotonic())
+        runs.append(time.perf_counter())
         if len(runs) <= 2:
             raise ConnectionError("peer offline")
         return outcome(LifecycleStatus.COMMITTED)
-    service, _ = make(tmp_path, cycle, poll_interval=30, on_error=errors.append)
+
+    service, _ = make(
+        tmp_path,
+        cycle,
+        poll_interval=30,
+        on_error=errors.append,
+    )
     try:
         service.start()
         until(lambda: service.status.state is ServiceState.RETRYING)
         until(lambda: len(runs) >= 3)
         until(lambda: service.status.state is ServiceState.RUNNING)
+
         assert len(errors) == 2
         assert runs[1] - runs[0] >= 0.02
         assert runs[2] - runs[1] >= 0.045
@@ -159,8 +194,12 @@ def test_transient_failures_back_off_and_recover(tmp_path):
 
 
 def test_review_required_is_reported_not_auto_resolved(tmp_path):
-    service, _ = make(tmp_path, lambda **_: outcome(LifecycleStatus.NEEDS_REVIEW),
-                      auto_apply=True, poll_interval=30)
+    service, _ = make(
+        tmp_path,
+        lambda **_: outcome(LifecycleStatus.NEEDS_REVIEW),
+        auto_apply=True,
+        poll_interval=30,
+    )
     try:
         service.start()
         until(lambda: service.status.state is ServiceState.NEEDS_REVIEW)
@@ -173,6 +212,7 @@ def test_pause_cancels_active_cycle_then_resume(tmp_path):
     entered = threading.Event()
     finished = threading.Event()
     runs = []
+
     def cycle(*, cancel_event, **_):
         runs.append(1)
         if len(runs) == 1:
@@ -181,6 +221,7 @@ def test_pause_cancels_active_cycle_then_resume(tmp_path):
             finished.set()
             return outcome(LifecycleStatus.PAUSED)
         return outcome()
+
     service, _ = make(tmp_path, cycle, poll_interval=30)
     try:
         service.start()
@@ -199,10 +240,12 @@ def test_pause_cancels_active_cycle_then_resume(tmp_path):
 
 def test_stop_cancels_inflight_without_deadlock(tmp_path):
     entered = threading.Event()
+
     def cycle(*, cancel_event, **_):
         entered.set()
         assert cancel_event.wait(2)
         return outcome(LifecycleStatus.PAUSED)
+
     service, _ = make(tmp_path, cycle)
     service.start()
     assert entered.wait(2)
@@ -214,11 +257,17 @@ def test_stop_cancels_inflight_without_deadlock(tmp_path):
 def test_stop_from_result_callback_is_safe(tmp_path):
     holder = {}
     finished = threading.Event()
+
     def on_result(_):
-        holder['service'].stop()
+        holder["service"].stop()
         finished.set()
-    service, _ = make(tmp_path, poll_interval=30, on_result=on_result)
-    holder['service'] = service
+
+    service, _ = make(
+        tmp_path,
+        poll_interval=30,
+        on_result=on_result,
+    )
+    holder["service"] = service
     service.start()
     assert finished.wait(2)
     until(lambda: service.status.state is ServiceState.STOPPED)
@@ -227,10 +276,17 @@ def test_stop_from_result_callback_is_safe(tmp_path):
 
 def test_callbacks_cannot_kill_worker(tmp_path):
     count = []
+
     def broken(_):
         raise RuntimeError("UI listener broke")
-    service, _ = make(tmp_path, lambda **_: (count.append(1), outcome())[1],
-                      poll_interval=0.04, on_result=broken, on_status=broken)
+
+    service, _ = make(
+        tmp_path,
+        lambda **_: (count.append(1), outcome())[1],
+        poll_interval=0.04,
+        on_result=broken,
+        on_status=broken,
+    )
     try:
         service.start()
         until(lambda: len(count) >= 3)
@@ -241,7 +297,11 @@ def test_callbacks_cannot_kill_worker(tmp_path):
 
 def test_duplicate_start_does_not_spawn_second_worker(tmp_path):
     count = []
-    service, _ = make(tmp_path, lambda **_: (count.append(1), outcome())[1], poll_interval=30)
+    service, _ = make(
+        tmp_path,
+        lambda **_: (count.append(1), outcome())[1],
+        poll_interval=30,
+    )
     try:
         service.start()
         service.start()
@@ -253,7 +313,11 @@ def test_duplicate_start_does_not_spawn_second_worker(tmp_path):
 
 def test_restart_after_stop(tmp_path):
     count = []
-    service, _ = make(tmp_path, lambda **_: (count.append(1), outcome())[1], poll_interval=30)
+    service, _ = make(
+        tmp_path,
+        lambda **_: (count.append(1), outcome())[1],
+        poll_interval=30,
+    )
     service.start()
     until(lambda: len(count) == 1)
     service.stop()
@@ -269,6 +333,7 @@ def test_worker_never_overlaps_cycles(tmp_path):
     maximum = 0
     counter = []
     mutex = threading.Lock()
+
     def cycle(**_):
         nonlocal active, maximum
         with mutex:
@@ -279,7 +344,12 @@ def test_worker_never_overlaps_cycles(tmp_path):
             active -= 1
             counter.append(1)
         return outcome()
-    service, _ = make(tmp_path, cycle, poll_interval=0.02)
+
+    service, _ = make(
+        tmp_path,
+        cycle,
+        poll_interval=0.02,
+    )
     try:
         service.start()
         for _ in range(10):
@@ -294,16 +364,26 @@ def test_status_and_progress_are_forwarded(tmp_path):
     events = []
     progresses = []
     reports = []
+
     def cycle(*, on_progress, **_):
-        on_progress('64KiB')
+        on_progress("64KiB")
         return outcome(LifecycleStatus.COMMITTED)
-    service, _ = make(tmp_path, cycle, poll_interval=30, on_status=events.append,
-                      on_result=reports.append, on_progress=progresses.append)
+
+    service, _ = make(
+        tmp_path,
+        cycle,
+        poll_interval=30,
+        on_status=events.append,
+        on_result=reports.append,
+        on_progress=progresses.append,
+    )
     try:
         service.start()
         until(lambda: len(reports) == 1)
-        assert progresses == ['64KiB']
-        assert any(x.state is ServiceState.RUNNING for x in events)
+        assert progresses == ["64KiB"]
+        assert any(
+            x.state is ServiceState.RUNNING for x in events
+        )
     finally:
         service.stop()
 
@@ -311,44 +391,70 @@ def test_status_and_progress_are_forwarded(tmp_path):
 def test_invalid_configuration_rejected(tmp_path):
     lifecycle = Mock(spec=SyncLifecycle)
     lifecycle.coordinator = SimpleNamespace(root=tmp_path)
+
     with pytest.raises(TypeError):
         AutoSyncService(object())
-    for key, bad in (("poll_interval", 0), ("retry_initial", -1),
-                     ("settle_delay", float('nan')), ("retry_max", float('inf')),
-                     ("watch_interval", True)):
+
+    for key, bad in (
+        ("poll_interval", 0),
+        ("retry_initial", -1),
+        ("settle_delay", float("nan")),
+        ("retry_max", float("inf")),
+        ("watch_interval", True),
+    ):
         with pytest.raises(ValueError):
             AutoSyncService(lifecycle, **{key: bad})
+
     with pytest.raises(ValueError):
         AutoSyncService(lifecycle, retry_initial=10, retry_max=2)
+
     with pytest.raises(TypeError):
-        AutoSyncService(lifecycle, auto_apply='yes')
+        AutoSyncService(lifecycle, auto_apply="yes")
+
     with pytest.raises(TypeError):
-        AutoSyncService(lifecycle, on_result='bad')
+        AutoSyncService(lifecycle, on_result="bad")
 
 
 def test_stop_rejects_invalid_timeout(tmp_path):
     service, _ = make(tmp_path)
-    for bad in (-1, float('nan'), True):
+    for bad in (-1, float("nan"), True):
         with pytest.raises(ValueError):
             service.stop(timeout=bad)
 
 
-def test_watch_error_reports_without_marking_cycle_failed(tmp_path, monkeypatch):
+def test_watch_error_reports_without_marking_cycle_failed(
+    tmp_path, monkeypatch
+):
     from syncbridge.core import sync_service as module
+
     watches = []
+
     class BrokenScanWatch:
         def __init__(self, root, on_change, *, interval, on_error):
             self.on_error = on_error
             watches.append(self)
+
         def poll_once(self):
-            self.on_error(RuntimeError('watch scan temporarily incomplete'))
+            self.on_error(
+                RuntimeError("watch scan temporarily incomplete")
+            )
+
         def start(self):
             pass
+
         def stop(self):
             pass
+
     monkeypatch.setattr(module, "FileWatcher", BrokenScanWatch)
+
     errors = []
-    service, _ = make(tmp_path, watch_local=True, poll_interval=30, on_error=errors.append)
+    service, _ = make(
+        tmp_path,
+        watch_local=True,
+        poll_interval=30,
+        on_error=errors.append,
+    )
+
     try:
         service.start()
         until(lambda: service.status.state is ServiceState.RUNNING)
