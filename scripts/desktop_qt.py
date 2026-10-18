@@ -1,5 +1,5 @@
 
-"""Launch SyncBridge's PySide6 desktop with live local-file list refresh."""
+"""Launch the SyncBridge Qt desktop with LAN and virtual-LAN discovery."""
 from __future__ import annotations
 
 import argparse
@@ -14,7 +14,10 @@ from syncbridge.storage.config import ConfigStore
 from syncbridge.ui.desktop_controller import DesktopController
 from syncbridge.ui.qt_local_refresh import QtLocalFileRefresh
 from syncbridge.ui.qt_onboarding import NetworkOptions
-from syncbridge.ui.qt_folder_switch_window import SyncBridgeFolderWindow
+from syncbridge.ui.qt_direct_discovery_window import (
+    SyncBridgeDiscoveryWindow,
+    discovery_targets_for_interfaces,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -36,7 +39,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remote-activation-port", type=int, default=ACTIVATION_PORT)
     args = parser.parse_args(argv)
 
-    targets = None
     if args.discovery_target:
         try:
             targets = tuple(
@@ -48,6 +50,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         except ValueError as exc:
             parser.error(f"Invalid discovery target: {exc}")
+    else:
+        # Broadcast separately to active LAN and virtual-LAN interfaces.
+        # No ZeroTier account, admin privileges or external service needed.
+        targets = discovery_targets_for_interfaces()
 
     store = ConfigStore(
         args.profile / "settings.json" if args.profile else None
@@ -71,10 +77,10 @@ def main(argv: list[str] | None = None) -> int:
         activation_port=args.activation_port,
         remote_activation_port=args.remote_activation_port,
     )
+
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("SyncBridge")
-
-    window = SyncBridgeFolderWindow(controller, network_options=options)
+    window = SyncBridgeDiscoveryWindow(controller, network_options=options)
     window.local_view_refresh = QtLocalFileRefresh(window)
     window.show()
     return app.exec()
