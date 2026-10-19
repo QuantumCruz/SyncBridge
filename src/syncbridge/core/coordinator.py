@@ -4,10 +4,14 @@
 Dry-run is the default. ``push_new=True`` retains the original create-only
 behavior. ``sync=True`` opts into share-bound uploads, downloads, and conditional
 updates. Divergent edits and deletions are NEVER resolved automatically.
-
 This class does not commit shared baselines; both devices still need a durable,
 recoverable agreement protocol. The remote manifest and transfer services must
 be configured to serve the SAME physical folder for the SAME share_id.
+
+For transfers, one complete validation runs immediately before the first
+change, between successive changes, and after the last completed change.
+There are no unvalidated gaps between planned transfers; every transfer also
+retains its individual cryptographic content and destination preconditions.
 """
 
 from __future__ import annotations
@@ -141,7 +145,6 @@ class SyncCoordinator:
             raise TypeError("shared_state must be a SharedStateDatabase")
         if manifest_client.identity.node_id != transfer_sender.identity.node_id:
             raise ValueError("Manifest and transfer clients must use the same identity")
-
         for label, value in (("peer_node_id", peer_node_id), ("share_id", share_id)):
             if (not isinstance(value, str) or len(value) != 32
                     or any(c not in "0123456789abcdef" for c in value)):
@@ -159,7 +162,6 @@ class SyncCoordinator:
         for label, port in (("manifest_port", manifest_port), ("transfer_port", transfer_port)):
             if type(port) is not int or not 1 <= port <= 65535:
                 raise ValueError(f"{label} must be between 1 and 65535")
-
         candidate = Path(local_root).expanduser()
         if candidate.is_symlink() or (
             hasattr(candidate, "is_junction") and candidate.is_junction()
@@ -168,7 +170,6 @@ class SyncCoordinator:
         root = candidate.resolve(strict=True)
         if not root.is_dir():
             raise NotADirectoryError(root)
-
         self.root = root
         self.peer_node_id = peer_node_id
         self.share_id = share_id
@@ -293,14 +294,25 @@ class SyncCoordinator:
             uploads: list[TransferResult] = []
             downloads: list[TransferResult] = []
             paused = False
+            completed_any = False
+
+            # One fresh full-folder check before each planned write.
+            # The check before item N+1 *also* verifies the completed
+            # effects of item N. This avoids an extra identical full
+            # round-trip between actions without leaving any transfer
+            # boundary unchecked. The final completed item receives a
+            # separate check below, including when cancellation occurs
+            # between actions.
             for decision in actions:
                 if cancel_event is not None and cancel_event.is_set():
                     paused = True
                     break
+
                 self._validate_current(
                     local, remote, preview.baseline_revision,
                     preview.remote.baseline_sha256,
                 )
+
                 if decision.action is SyncAction.UPLOAD:
                     expected = _fingerprint(decision.local)
                     if expected is None or local.get(decision.path) != expected:
@@ -327,11 +339,8 @@ class SyncCoordinator:
                             or (result.total, result.sha256) != expected):
                         raise StaleSyncState("Uploaded content differs from planned inventory")
                     remote[decision.path] = expected
-                    self._validate_current(
-                        local, remote, preview.baseline_revision,
-                        preview.remote.baseline_sha256,
-                    )
                     uploads.append(result)
+                    completed_any = True
 
                 elif full_sync and decision.action is SyncAction.DOWNLOAD:
                     expected = _fingerprint(decision.remote)
@@ -355,11 +364,17 @@ class SyncCoordinator:
                             or (result.total, result.sha256) != expected):
                         raise StaleSyncState("Downloaded content differs from planned inventory")
                     local[decision.path] = expected
-                    self._validate_current(
-                        local, remote, preview.baseline_revision,
-                        preview.remote.baseline_sha256,
-                    )
                     downloads.append(result)
+                    completed_any = True
+
+            # Never return a successful or partially completed cycle
+            # without validating its final observed full-folder state.
+            # This includes cancellation after one or more completed files.
+            if completed_any:
+                self._validate_current(
+                    local, remote, preview.baseline_revision,
+                    preview.remote.baseline_sha256,
+                )
 
             # Deliberately do NOT advance a shared baseline here. A successful
             # file copy does not mean the remote side has acknowledged a commit.
