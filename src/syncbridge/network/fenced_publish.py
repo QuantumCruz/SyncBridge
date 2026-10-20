@@ -1,16 +1,14 @@
 
 """Receiver-local fenced publication of fully verified staged files.
 
-This is an enforcement building block, not a network endpoint. The authenticated
-transfer receiver must supply the actual peer node ID and the lease returned by
-the receiver's own authority; never trust an owner ID asserted in an offer.
+The receiver must supply the authenticated peer identity and a receiver-issued
+lease. The optional before_publish callback can enforce additional operation
+authorization inside the receiver's existing SQLite publication transaction.
 
-A SQLite BEGIN IMMEDIATE transaction is held across the final lease check,
-destination precondition, and filesystem publish. Therefore other clients of
-the SAME authority database cannot revoke/supersede the lease mid-publication.
-This does not make SQLite + filesystem one crash-atomic transaction, prevent
-unrelated programs from editing files, or enforce leases in the existing
-TransferService until that service is explicitly integrated.
+The SQLite lock serializes users of the SAME receiver authority database.
+It cannot atomically lock an elected operation authority on another computer,
+nor can it prevent unrelated filesystem writers or make SQLite and filesystem
+changes one crash-atomic transaction.
 """
 from __future__ import annotations
 
@@ -19,8 +17,13 @@ import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-from syncbridge.network.lease_fencing import FencedOut, LeaseAuthority, LeaseGrant
+from syncbridge.network.lease_fencing import (
+    FencedOut,
+    LeaseAuthority,
+    LeaseGrant,
+)
 from syncbridge.network.transfer import (
     _child,
     _hash_file,
@@ -35,7 +38,7 @@ _STAGE = re.compile(r"[0-9a-f]{64}\.part\Z")
 
 
 class PublishConflict(RuntimeError):
-    """The target or staged bytes do not match the approved preconditions."""
+    """The target or staged bytes do not match approved preconditions."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,9 +61,13 @@ def _digest(value: str) -> str:
     return value
 
 
-def _regular_fingerprint(path: Path) -> tuple[int, str, os.stat_result]:
+def _regular_fingerprint(
+    path: Path,
+) -> tuple[int, str, os.stat_result]:
     if _linked(path):
-        raise PublishConflict("Linked files are not eligible for publication")
+        raise PublishConflict(
+            "Linked files are not eligible for publication"
+        )
 
     flags = (
         os.O_RDONLY
@@ -71,27 +78,37 @@ def _regular_fingerprint(path: Path) -> tuple[int, str, os.stat_result]:
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        raise PublishConflict("Cannot read the file for verification") from exc
+        raise PublishConflict(
+            "Cannot read the file for verification"
+        ) from exc
 
     with os.fdopen(fd, "rb") as stream:
         before = os.fstat(stream.fileno())
 
         if not stat.S_ISREG(before.st_mode):
-            raise PublishConflict("Publication requires a regular file")
+            raise PublishConflict(
+                "Publication requires a regular file"
+            )
 
         actual = _hash_file(stream)
         after = os.fstat(stream.fileno())
 
         if not _same_stat(before, after):
-            raise PublishConflict("File changed during verification")
+            raise PublishConflict(
+                "File changed during verification"
+            )
 
     try:
         named = path.stat()
     except OSError as exc:
-        raise PublishConflict("File disappeared during verification") from exc
+        raise PublishConflict(
+            "File disappeared during verification"
+        ) from exc
 
     if not _same_stat(before, named) or _linked(path):
-        raise PublishConflict("File changed during verification")
+        raise PublishConflict(
+            "File changed during verification"
+        )
 
     return before.st_size, actual, before
 
@@ -99,9 +116,12 @@ def _regular_fingerprint(path: Path) -> tuple[int, str, os.stat_result]:
 class FencedFilePublisher:
     """Publish receiver-controlled staging bytes under a receiver-owned fence.
 
-    A staging filename must be a direct '<64 hex>.part' child of staging_root,
-    matching TransferService's existing resume slot naming convention.
-    The staging directory must be on the same filesystem as the destination.
+    A staging filename must be a direct '<64 hex>.part' child of staging_root.
+    Staging and destination must use the same filesystem for publication.
+
+    before_publish is an optional authorization hook. It must raise on any
+    failed authorization and must not mutate the destination or lease database.
+    It executes while the receiver-local SQLite write transaction is held.
     """
 
     def __init__(
@@ -110,23 +130,42 @@ class FencedFilePublisher:
         share_id: str,
         destination_root: str | Path,
         staging_root: str | Path,
+        *,
+        before_publish: Callable[[LeaseGrant], None] | None = None,
     ) -> None:
         if not isinstance(authority, LeaseAuthority):
-            raise TypeError("authority must be LeaseAuthority")
+            raise TypeError(
+                "authority must be LeaseAuthority"
+            )
+
+        if before_publish is not None and not callable(before_publish):
+            raise TypeError(
+                "before_publish must be callable or None"
+            )
 
         self.share_id = _id(share_id)
         self.authority = authority
-        self.destination_root = Path(destination_root).absolute()
-        self.staging_root = Path(staging_root).absolute()
+        self.destination_root = Path(
+            destination_root
+        ).absolute()
+        self.staging_root = Path(
+            staging_root
+        ).absolute()
+        self.before_publish = before_publish
 
-        for root in (self.destination_root, self.staging_root):
+        for root in (
+            self.destination_root,
+            self.staging_root,
+        ):
             if _linked(root) or not root.is_dir():
                 raise ValueError(
                     "Publisher roots must be real existing directories"
                 )
 
         if self.destination_root == self.staging_root:
-            raise ValueError("Staging and destination must differ")
+            raise ValueError(
+                "Staging and destination must differ"
+            )
 
         if (
             self.destination_root in self.staging_root.parents
@@ -137,13 +176,23 @@ class FencedFilePublisher:
             )
 
     @staticmethod
-    def _publish_file(stage: Path, target: Path, exists: bool) -> None:
+    def _publish_file(
+        stage: Path,
+        target: Path,
+        exists: bool,
+    ) -> None:
         if exists:
             os.replace(stage, target)
         else:
-            # Creates only if still absent, even against an unrelated writer.
             os.link(stage, target)
             stage.unlink()
+
+    def _require_extra_authorization(
+        self,
+        lease: LeaseGrant,
+    ) -> None:
+        if self.before_publish is not None:
+            self.before_publish(lease)
 
     def publish(
         self,
@@ -156,12 +205,7 @@ class FencedFilePublisher:
         expected_sha256: str,
         expected_destination_sha256: str | None,
     ) -> FencedPublishResult:
-        """Verify and publish under an exclusive receiver-local lease lock.
-
-        Caller must already have authenticated the network peer, received and
-        fsynced the full staging file, and verified the approved share binding.
-        Existing transfer behavior remains unchanged until explicitly wired.
-        """
+        """Verify and publish under the receiver's exclusive local fence."""
         self.authority._valid_grant(lease)
         peer = _id(authenticated_peer_id)
 
@@ -179,13 +223,17 @@ class FencedFilePublisher:
             not isinstance(staging_name, str)
             or _STAGE.fullmatch(staging_name) is None
         ):
-            raise ValueError("Invalid receiver staging filename")
+            raise ValueError(
+                "Invalid receiver staging filename"
+            )
 
         if (
             type(expected_size) is not int
             or not 0 <= expected_size <= (1 << 63) - 1
         ):
-            raise ValueError("Invalid expected file size")
+            raise ValueError(
+                "Invalid expected file size"
+            )
 
         digest = _digest(expected_sha256)
 
@@ -193,24 +241,34 @@ class FencedFilePublisher:
             _digest(expected_destination_sha256)
 
         stage = self.staging_root / staging_name
-        size, stage_digest, stage_stat = _regular_fingerprint(stage)
+        size, stage_digest, stage_stat = (
+            _regular_fingerprint(stage)
+        )
 
         if size != expected_size or stage_digest != digest:
             raise PublishConflict(
                 "Staged file does not match approved content"
             )
 
-        # Every lease holder, including one in another process, must use
-        # this same database. BEGIN IMMEDIATE excludes simultaneous lease
-        # acquisition/release while this publication is in progress.
         with self.authority._write() as connection:
             now = self.authority._now()
-            row = self.authority._row(connection, self.share_id)
+            row = self.authority._row(
+                connection,
+                self.share_id,
+            )
 
             self.authority._check_clock(row, now)
-            self.authority._current(row, lease, now)
+            self.authority._current(
+                row,
+                lease,
+                now,
+            )
 
-            target = _child(self.destination_root, parts)
+            target = _child(
+                self.destination_root,
+                parts,
+            )
+
             exists = target.exists()
 
             if exists:
@@ -222,23 +280,40 @@ class FencedFilePublisher:
                     current_size == size
                     and current_digest == digest
                 ):
-                    # Idempotent completion, but only for the current holder.
                     if (
-                        not _same_stat(stage.stat(), stage_stat)
+                        not _same_stat(
+                            stage.stat(),
+                            stage_stat,
+                        )
                         or _linked(stage)
                     ):
                         raise PublishConflict(
                             "Staged file changed before publication"
                         )
 
+                    # Even an idempotent completion must not be
+                    # acknowledged under a known-lost operation.
+                    self._require_extra_authorization(lease)
+
+                    self.authority._current(
+                        row,
+                        lease,
+                        self.authority._now(),
+                    )
+
                     stage.unlink()
+
                     return FencedPublishResult(
-                        relative_path, digest, size, True
+                        relative_path,
+                        digest,
+                        size,
+                        True,
                     )
 
                 if (
                     expected_destination_sha256 is None
-                    or current_digest != expected_destination_sha256
+                    or current_digest
+                    != expected_destination_sha256
                 ):
                     raise PublishConflict(
                         "Destination changed; refusing overwrite"
@@ -256,23 +331,43 @@ class FencedFilePublisher:
             )
 
             if (
-                not _same_stat(stage.stat(), stage_stat)
+                not _same_stat(
+                    stage.stat(),
+                    stage_stat,
+                )
                 or _linked(stage)
             ):
                 raise PublishConflict(
                     "Staged file changed before publication"
                 )
 
-            # Recheck expiration immediately before publishing, still
-            # holding the transaction lock.
+            # Receiver-side fencing and additional authorization
+            # are both checked while holding the same local
+            # publication transaction. Remote operation validation
+            # remains a point-in-time check, not a distributed lock.
             self.authority._current(
                 row,
                 lease,
                 self.authority._now(),
             )
 
-            self._publish_file(stage, target, exists)
+            self._require_extra_authorization(lease)
+
+            self.authority._current(
+                row,
+                lease,
+                self.authority._now(),
+            )
+
+            self._publish_file(
+                stage,
+                target,
+                exists,
+            )
 
         return FencedPublishResult(
-            relative_path, digest, size, False
+            relative_path,
+            digest,
+            size,
+            False,
         )
