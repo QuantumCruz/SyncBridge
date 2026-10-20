@@ -1,5 +1,5 @@
 
-"""Launch SyncBridge's Qt desktop with safe preview diagnostics."""
+"""Launch SyncBridge's Qt desktop with fenced manual synchronization."""
 from __future__ import annotations
 
 import argparse
@@ -26,65 +26,101 @@ def main(argv: list[str] | None = None) -> int:
         description="SyncBridge desktop"
     )
 
-    parser.add_argument("--profile", type=Path)
+    parser.add_argument(
+        "--profile",
+        type=Path,
+    )
+
     parser.add_argument(
         "--bind-address",
         default="0.0.0.0",
     )
+
     parser.add_argument(
         "--listen-ports",
         type=int,
         nargs=3,
     )
+
     parser.add_argument(
         "--lock-port",
         type=int,
         default=45846,
     )
+
     parser.add_argument(
         "--validation-port",
         type=int,
         default=45847,
     )
+
+    # No explicit value means derive the lease endpoint from
+    # the existing configured transfer endpoint.
+    #
+    # Normal installations still use port 45849.
+    # Explicit values remain available for test environments.
+    parser.add_argument(
+        "--lease-listen-port",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--remote-lease-port",
+        type=int,
+        default=None,
+    )
+
     parser.add_argument(
         "--discovery-port",
         type=int,
         default=DISCOVERY_PORT,
     )
+
     parser.add_argument(
         "--discovery-bind",
         default="0.0.0.0",
     )
-    parser.add_argument("--discovery-name")
+
+    parser.add_argument(
+        "--discovery-name",
+    )
+
     parser.add_argument(
         "--discovery-target",
         action="append",
         metavar="IP:PORT",
     )
+
     parser.add_argument(
         "--pairing-port",
         type=int,
         default=PAIRING_PORT,
     )
+
     parser.add_argument(
         "--pairing-bind",
         default="0.0.0.0",
     )
+
     parser.add_argument(
         "--setup-port",
         type=int,
         default=SETUP_PORT,
     )
+
     parser.add_argument(
         "--remote-setup-port",
         type=int,
         default=SETUP_PORT,
     )
+
     parser.add_argument(
         "--activation-port",
         type=int,
         default=ACTIVATION_PORT,
     )
+
     parser.add_argument(
         "--remote-activation-port",
         type=int,
@@ -125,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
         lock_port=args.lock_port,
         validation_port=args.validation_port,
+        lease_listen_port=args.lease_listen_port,
+        remote_lease_port=args.remote_lease_port,
     )
 
     options = NetworkOptions(
@@ -148,7 +186,9 @@ def main(argv: list[str] | None = None) -> int:
         network_options=options,
     )
 
-    window.local_view_refresh = QtLocalFileRefresh(window)
+    window.local_view_refresh = QtLocalFileRefresh(
+        window
+    )
 
     window.show()
 
