@@ -1,5 +1,5 @@
 
-"""Headless checks for the desktop's real guarded-runtime adapter."""
+"""Headless desktop adapter and authoritative lifecycle checks."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -19,7 +19,11 @@ from syncbridge.storage.config import (
 from syncbridge.ui.desktop_controller import (
     DesktopConfigurationError,
     DesktopController,
+    DesktopLifecycle,
+    DesktopLifecycleError,
+    DesktopPhase,
     describe_preview,
+    desktop_buttons,
 )
 
 
@@ -284,3 +288,292 @@ def test_configured_runtime_parameters_are_forwarded(setup):
     )
     assert desktop.runtime.settings["lock_port"] == 45104
     assert desktop.runtime.settings["validation_port"] == 45105
+
+
+# -------------------------------------------------------------------
+# Authoritative desktop lifecycle
+# -------------------------------------------------------------------
+
+
+def test_desktop_always_begins_disconnected():
+    lifecycle = DesktopLifecycle()
+
+    assert lifecycle.phase is DesktopPhase.DISCONNECTED
+    assert lifecycle.generation == 0
+    assert lifecycle.allowed_buttons() == frozenset({
+        "find",
+    })
+
+
+def test_saved_pairing_does_not_restore_a_live_session():
+    lifecycle = DesktopLifecycle()
+
+    assert lifecycle.phase is DesktopPhase.DISCONNECTED
+
+    assert lifecycle.allowed_buttons(
+        saved_peer=True
+    ) == frozenset({
+        "find",
+        "reconnect",
+    })
+
+    assert "preview" not in lifecycle.allowed_buttons(
+        saved_peer=True
+    )
+    assert "sync" not in lifecycle.allowed_buttons(
+        saved_peer=True,
+        preview_ready=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "phase,saved_peer,preview_ready,expected",
+    [
+        (
+            DesktopPhase.DISCONNECTED,
+            False,
+            False,
+            {"find"},
+        ),
+        (
+            DesktopPhase.DISCONNECTED,
+            True,
+            False,
+            {"find", "reconnect"},
+        ),
+        (
+            DesktopPhase.PAIRING,
+            True,
+            False,
+            set(),
+        ),
+        (
+            DesktopPhase.CHOOSING_FOLDER,
+            False,
+            False,
+            {"choose_folder"},
+        ),
+        (
+            DesktopPhase.CONNECTING,
+            True,
+            False,
+            set(),
+        ),
+        (
+            DesktopPhase.CONNECTED,
+            True,
+            False,
+            {
+                "change_folder",
+                "open_folder",
+                "preview",
+                "disconnect",
+            },
+        ),
+        (
+            DesktopPhase.CONNECTED,
+            True,
+            True,
+            {
+                "change_folder",
+                "open_folder",
+                "preview",
+                "sync",
+                "disconnect",
+            },
+        ),
+        (
+            DesktopPhase.SYNCHRONIZING,
+            True,
+            True,
+            set(),
+        ),
+        (
+            DesktopPhase.CHANGING_FOLDERS,
+            True,
+            True,
+            set(),
+        ),
+        (
+            DesktopPhase.DISCONNECTING,
+            True,
+            True,
+            set(),
+        ),
+    ],
+)
+def test_only_allowed_buttons_are_enabled(
+    phase,
+    saved_peer,
+    preview_ready,
+    expected,
+):
+    assert desktop_buttons(
+        phase,
+        saved_peer=saved_peer,
+        preview_ready=preview_ready,
+    ) == frozenset(expected)
+
+
+def test_complete_first_time_connection_flow():
+    lifecycle = DesktopLifecycle()
+
+    steps = (
+        DesktopPhase.PAIRING,
+        DesktopPhase.CHOOSING_FOLDER,
+        DesktopPhase.CONNECTING,
+        DesktopPhase.CONNECTED,
+        DesktopPhase.SYNCHRONIZING,
+        DesktopPhase.CONNECTED,
+        DesktopPhase.DISCONNECTING,
+        DesktopPhase.DISCONNECTED,
+    )
+
+    for number, phase in enumerate(steps, start=1):
+        generation = lifecycle.transition(phase)
+        assert lifecycle.phase is phase
+        assert generation == number
+
+    assert lifecycle.allowed_buttons(
+        saved_peer=True
+    ) == frozenset({
+        "find",
+        "reconnect",
+    })
+
+
+def test_returning_device_requires_a_new_live_connection():
+    lifecycle = DesktopLifecycle()
+
+    lifecycle.transition(DesktopPhase.CONNECTING)
+
+    assert lifecycle.allowed_buttons(
+        saved_peer=True
+    ) == frozenset()
+
+    lifecycle.transition(DesktopPhase.CONNECTED)
+
+    assert "preview" in lifecycle.allowed_buttons()
+
+
+def test_folder_change_requires_connected_session():
+    lifecycle = DesktopLifecycle()
+
+    with pytest.raises(DesktopLifecycleError):
+        lifecycle.transition(
+            DesktopPhase.CHANGING_FOLDERS
+        )
+
+    lifecycle.transition(DesktopPhase.CONNECTING)
+    lifecycle.transition(DesktopPhase.CONNECTED)
+    lifecycle.transition(DesktopPhase.CHANGING_FOLDERS)
+
+    assert lifecycle.allowed_buttons() == frozenset()
+
+    lifecycle.transition(DesktopPhase.CHOOSING_FOLDER)
+
+    assert lifecycle.allowed_buttons() == frozenset({
+        "choose_folder",
+    })
+
+
+def test_disconnect_prevents_operations_until_complete():
+    lifecycle = DesktopLifecycle()
+
+    lifecycle.transition(DesktopPhase.CONNECTING)
+    lifecycle.transition(DesktopPhase.CONNECTED)
+    lifecycle.transition(DesktopPhase.DISCONNECTING)
+
+    assert lifecycle.allowed_buttons(
+        saved_peer=True,
+        preview_ready=True,
+    ) == frozenset()
+
+    with pytest.raises(DesktopLifecycleError):
+        lifecycle.transition(
+            DesktopPhase.CONNECTED
+        )
+
+    lifecycle.transition(DesktopPhase.DISCONNECTED)
+
+    assert lifecycle.allowed_buttons(
+        saved_peer=True,
+        preview_ready=True,
+    ) == frozenset({
+        "find",
+        "reconnect",
+    })
+
+
+def test_unexpected_disconnect_during_sync_is_allowed():
+    lifecycle = DesktopLifecycle()
+
+    lifecycle.transition(DesktopPhase.CONNECTING)
+    lifecycle.transition(DesktopPhase.CONNECTED)
+    lifecycle.transition(DesktopPhase.SYNCHRONIZING)
+    lifecycle.transition(DesktopPhase.DISCONNECTING)
+
+    assert lifecycle.allowed_buttons() == frozenset()
+
+    lifecycle.transition(DesktopPhase.DISCONNECTED)
+
+    assert lifecycle.phase is DesktopPhase.DISCONNECTED
+
+
+def test_invalid_transitions_are_refused():
+    lifecycle = DesktopLifecycle()
+
+    with pytest.raises(
+        DesktopLifecycleError,
+        match="Invalid desktop transition",
+    ):
+        lifecycle.transition(
+            DesktopPhase.SYNCHRONIZING
+        )
+
+    assert lifecycle.phase is DesktopPhase.DISCONNECTED
+    assert lifecycle.generation == 0
+
+
+def test_duplicate_state_change_does_not_advance_generation():
+    lifecycle = DesktopLifecycle()
+
+    assert lifecycle.transition(
+        DesktopPhase.DISCONNECTED
+    ) == 0
+
+    assert lifecycle.transition(
+        DesktopPhase.PAIRING
+    ) == 1
+
+    assert lifecycle.transition(
+        DesktopPhase.PAIRING
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [None, True, "connected", 3],
+)
+def test_invalid_state_type_is_rejected(invalid):
+    lifecycle = DesktopLifecycle()
+
+    with pytest.raises(TypeError):
+        lifecycle.transition(invalid)
+
+
+def test_invalid_button_permission_inputs_are_rejected():
+    with pytest.raises(TypeError):
+        desktop_buttons("connected")
+
+    with pytest.raises(TypeError):
+        desktop_buttons(
+            DesktopPhase.DISCONNECTED,
+            saved_peer=1,
+        )
+
+    with pytest.raises(TypeError):
+        desktop_buttons(
+            DesktopPhase.CONNECTED,
+            preview_ready="yes",
+        )

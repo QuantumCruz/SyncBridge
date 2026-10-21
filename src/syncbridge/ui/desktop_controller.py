@@ -1,17 +1,18 @@
 
 """Headless adapter for SyncBridge's manual desktop synchronization UI.
 
-Uses operation-bound, receiver-fenced transfers by default. The existing
-pairing, folder selection, preview and manual Sync experience is preserved.
+Uses operation-bound, receiver-fenced transfers by default.
 
-For separate desktop profiles sharing one machine, automatically derive the
-authenticated lease-control ports from their configured transfer ports.
-The normal transfer port 45842 continues to use lease port 45849.
-Explicit lease-port overrides always take precedence.
+DesktopLifecycle defines the allowed desktop states and button permissions.
+The Qt desktop will own one instance and use it as its sole UI-state authority.
+
+For separate desktop profiles sharing one machine, lease-control ports are
+derived from the configured transfer ports. Port overrides take precedence.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable
 
@@ -24,6 +25,160 @@ from syncbridge.storage.config import ConfigStore
 
 class DesktopConfigurationError(RuntimeError):
     """The selected desktop profile cannot start synchronization."""
+
+
+class DesktopLifecycleError(RuntimeError):
+    """The desktop attempted an invalid state transition."""
+
+
+class DesktopPhase(str, Enum):
+    """The one authoritative phase of a desktop connection."""
+
+    DISCONNECTED = "disconnected"
+    PAIRING = "pairing"
+    CHOOSING_FOLDER = "choosing_folder"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    SYNCHRONIZING = "synchronizing"
+    CHANGING_FOLDERS = "changing_folders"
+    DISCONNECTING = "disconnecting"
+
+
+_TRANSITIONS = {
+    DesktopPhase.DISCONNECTED: frozenset({
+        DesktopPhase.PAIRING,
+        DesktopPhase.CONNECTING,
+    }),
+    DesktopPhase.PAIRING: frozenset({
+        DesktopPhase.CHOOSING_FOLDER,
+        DesktopPhase.DISCONNECTING,
+    }),
+    DesktopPhase.CHOOSING_FOLDER: frozenset({
+        DesktopPhase.CONNECTING,
+        DesktopPhase.DISCONNECTING,
+    }),
+    DesktopPhase.CONNECTING: frozenset({
+        DesktopPhase.CONNECTED,
+        DesktopPhase.DISCONNECTING,
+    }),
+    DesktopPhase.CONNECTED: frozenset({
+        DesktopPhase.SYNCHRONIZING,
+        DesktopPhase.CHANGING_FOLDERS,
+        DesktopPhase.DISCONNECTING,
+    }),
+    DesktopPhase.SYNCHRONIZING: frozenset({
+        DesktopPhase.CONNECTED,
+        DesktopPhase.DISCONNECTING,
+    }),
+    DesktopPhase.CHANGING_FOLDERS: frozenset({
+        DesktopPhase.CHOOSING_FOLDER,
+        DesktopPhase.DISCONNECTING,
+    }),
+    DesktopPhase.DISCONNECTING: frozenset({
+        DesktopPhase.DISCONNECTED,
+    }),
+}
+
+
+def desktop_buttons(
+    phase: DesktopPhase,
+    *,
+    saved_peer: bool = False,
+    preview_ready: bool = False,
+) -> frozenset[str]:
+    """One place to decide which main-window actions are permitted.
+
+    The returning-user shortcut requires a saved relationship.
+    Sync requires a fresh, safe Preview from the current connection.
+
+    Network listeners must independently enforce session authorization.
+    A disabled Qt button is never considered a security boundary.
+    """
+    if not isinstance(phase, DesktopPhase):
+        raise TypeError("phase must be DesktopPhase")
+
+    if type(saved_peer) is not bool:
+        raise TypeError("saved_peer must be bool")
+
+    if type(preview_ready) is not bool:
+        raise TypeError("preview_ready must be bool")
+
+    if phase is DesktopPhase.DISCONNECTED:
+        actions = {"find"}
+        if saved_peer:
+            actions.add("reconnect")
+        return frozenset(actions)
+
+    if phase is DesktopPhase.CHOOSING_FOLDER:
+        return frozenset({"choose_folder"})
+
+    if phase is DesktopPhase.CONNECTED:
+        actions = {
+            "change_folder",
+            "open_folder",
+            "preview",
+            "disconnect",
+        }
+        if preview_ready:
+            actions.add("sync")
+        return frozenset(actions)
+
+    # Pairing, connecting, synchronizing, changing folders and
+    # disconnecting do not permit conflicting main-window actions.
+    return frozenset()
+
+
+class DesktopLifecycle:
+    """Small in-memory state machine; never stores network credentials.
+
+    Transitions must be applied by the owner of the desktop event loop.
+    Background workers return results to that owner instead of changing
+    desktop state or widgets directly.
+
+    The generation changes on each actual state transition, allowing the
+    desktop to discard results produced for an obsolete operation.
+    """
+
+    def __init__(self) -> None:
+        self._phase = DesktopPhase.DISCONNECTED
+        self._generation = 0
+
+    @property
+    def phase(self) -> DesktopPhase:
+        return self._phase
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def transition(self, next_phase: DesktopPhase) -> int:
+        if not isinstance(next_phase, DesktopPhase):
+            raise TypeError("next_phase must be DesktopPhase")
+
+        if next_phase is self._phase:
+            return self._generation
+
+        if next_phase not in _TRANSITIONS[self._phase]:
+            raise DesktopLifecycleError(
+                f"Invalid desktop transition: "
+                f"{self._phase.value} -> {next_phase.value}"
+            )
+
+        self._phase = next_phase
+        self._generation += 1
+        return self._generation
+
+    def allowed_buttons(
+        self,
+        *,
+        saved_peer: bool = False,
+        preview_ready: bool = False,
+    ) -> frozenset[str]:
+        return desktop_buttons(
+            self._phase,
+            saved_peer=saved_peer,
+            preview_ready=preview_ready,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,13 +238,6 @@ _ACTIONS = {
 _DEFAULT_TRANSFER_PORT = 45842
 _DEFAULT_LEASE_PORT = 45849
 
-# Custom test profiles already advertise their transfer ports.
-# Use a deterministic, non-identity port permutation to keep their
-# lease listeners separate without another pairing protocol.
-#
-# The offset deliberately moves common Windows ephemeral TCP ports
-# out of that range. It cannot guarantee that an unrelated process
-# has not occupied the derived port.
 _MIN_CUSTOM_PORT = 1025
 _PORT_SPAN = 65535 - _MIN_CUSTOM_PORT + 1
 _PORT_SHIFT = 20000
@@ -98,11 +246,8 @@ _PORT_SHIFT = 20000
 def _lease_port_for_transfer(transfer_port: int) -> int:
     """Compute the same lease port on both ends of a configured connection.
 
-    Keep the existing production default, while allowing independent
-    localhost profiles to have different lease listeners.
-
-    The mapping is deterministic and one-to-one for supported ports.
-    It does not require a new network handshake.
+    Preserve the production port and derive independent ports for local
+    multi-profile testing. Explicit overrides always take precedence.
     """
     if (
         type(transfer_port) is not int
@@ -118,12 +263,9 @@ def _lease_port_for_transfer(transfer_port: int) -> int:
             % _PORT_SPAN
         )
 
-    # Preserve the existing real-computer deployment port.
     if transfer_port == _DEFAULT_TRANSFER_PORT:
         return _DEFAULT_LEASE_PORT
 
-    # Maintain unique mapping even for a custom transfer port that
-    # would otherwise map to the production lease port.
     ordinary = rotated(transfer_port)
 
     if ordinary == _DEFAULT_LEASE_PORT:
@@ -218,12 +360,9 @@ class DesktopController:
         self._lease_listen_override = lease_listen_port
         self._remote_lease_override = remote_lease_port
 
-        # Create the runtime immediately because the existing Qt
-        # onboarding layer reads runtime.listen_ports before the
-        # user has chosen any shared folder.
-        #
-        # For default ports, the final selection happens in start()
-        # after pairing and folder setup have populated the profile.
+        # The existing onboarding layer reads runtime.listen_ports
+        # before the user has chosen a folder. Keep runtime creation
+        # independent of the future desktop UI lifecycle.
         self.runtime = runtime_factory(
             self.store,
             bind_address=bind_address,
@@ -285,17 +424,12 @@ class DesktopController:
         )
 
     def _configure_lease_ports(self) -> None:
-        """Match lease endpoints to the two configured transfer endpoints.
-
-        Must run before starting the fenced runtime. Recalculated after
-        folder changes so the controller never uses stale peer ports.
-        """
+        """Match lease endpoints to the configured transfer endpoints."""
         if not isinstance(
             self.runtime,
             FencedGuardedManualRuntime,
         ):
-            # Preserve test injection and alternative controller
-            # implementations without changing their behavior.
+            # Preserve test injection and alternative controllers.
             return
 
         enabled = [
@@ -312,8 +446,6 @@ class DesktopController:
         share = enabled[0]
 
         if self._listen_ports is None:
-            # Without an override, the runtime uses the configured
-            # standard listener ports.
             local_transfer_port = share.transfer_port
         else:
             local_transfer_port = self._listen_ports[1]
@@ -346,13 +478,11 @@ class DesktopController:
             return
 
         self.profile()
-
         self._configure_lease_ports()
 
         self.runtime.start(
             background=False
         )
-
         self._started = True
 
     def stop(self) -> None:
