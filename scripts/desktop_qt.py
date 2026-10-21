@@ -1,5 +1,5 @@
 
-"""Launch SyncBridge's Qt desktop with fenced manual synchronization."""
+"""Launch SyncBridge with explicit, mutually approved desktop connections."""
 from __future__ import annotations
 
 import argparse
@@ -12,12 +12,16 @@ from syncbridge.network.pairing import PAIRING_PORT
 from syncbridge.network.share_activation import ACTIVATION_PORT
 from syncbridge.network.share_setup import SETUP_PORT
 from syncbridge.storage.config import ConfigStore
-from syncbridge.ui.preview_diagnostics import DiagnosticDesktopController
+from syncbridge.ui.preview_diagnostics import (
+    DiagnosticDesktopController,
+)
 from syncbridge.ui.qt_local_refresh import QtLocalFileRefresh
 from syncbridge.ui.qt_onboarding import NetworkOptions
 from syncbridge.ui.qt_direct_discovery_window import (
-    SyncBridgeDiscoveryWindow,
     discovery_targets_for_interfaces,
+)
+from syncbridge.ui.qt_mutual_session_window import (
+    SyncBridgeMutualSessionWindow,
 )
 
 
@@ -54,11 +58,6 @@ def main(argv: list[str] | None = None) -> int:
         default=45847,
     )
 
-    # No explicit value means derive the lease endpoint from
-    # the existing configured transfer endpoint.
-    #
-    # Normal installations still use port 45849.
-    # Explicit values remain available for test environments.
     parser.add_argument(
         "--lease-listen-port",
         type=int,
@@ -181,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("SyncBridge")
 
-    window = SyncBridgeDiscoveryWindow(
+    window = SyncBridgeMutualSessionWindow(
         controller,
         network_options=options,
     )
