@@ -1,0 +1,23 @@
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "syncbridge"
+version = "0.1.0"
+description = "Secure, manually approved peer-to-peer folder synchronization for Windows"
+readme = "README.md"
+requires-python = ">=3.12,<3.16"
+dependencies = [
+    "cryptography>=42,<49",
+    "PySide6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9,<10"]
+build = ["pyinstaller>=6.22.3,<7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["syncbridge*"]

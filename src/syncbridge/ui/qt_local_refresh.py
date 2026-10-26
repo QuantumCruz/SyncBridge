@@ -1,8 +1,8 @@
 
-"""Refresh the receiving computer's visible file list without syncing.
+"""Refresh the visible local file list without initiating synchronization.
 
-Only file names and sizes are read; no hashes, writes or remote requests.
-The scan runs on a background thread and Qt widgets update on the UI thread.
+Supports both the legacy Qt window and the mutual-session desktop window.
+Filesystem scanning runs on a worker; widgets update only on the Qt thread.
 """
 from __future__ import annotations
 
@@ -11,9 +11,11 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
+from syncbridge.ui.desktop_controller import DesktopPhase
+
 
 class QtLocalFileRefresh(QObject):
-    """Watch the displayed 'My files' list using lightweight periodic scans."""
+    """Refresh the My files tab when local file names or sizes change."""
 
     scan_finished = Signal(str, object)
     scan_failed = Signal()
@@ -25,7 +27,6 @@ class QtLocalFileRefresh(QObject):
 
         self.window = window
         self._scanning = False
-
         self.scan_finished.connect(self._apply_result)
         self.scan_failed.connect(self._reset_scan)
 
@@ -33,21 +34,28 @@ class QtLocalFileRefresh(QObject):
         self.timer.setInterval(interval_ms)
         self.timer.timeout.connect(self.check)
         self.timer.start()
-
-        # Checking upon returning to the tab avoids waiting for the next tick.
         window.tabs.currentChanged.connect(self._on_tab_changed)
 
+    def _modern(self) -> bool:
+        return hasattr(self.window, "lifecycle")
+
     def _eligible(self) -> bool:
-        w = self.window
+        window = self.window
+        if (
+            window._closing
+            or window._busy
+            or not window.controller.running
+            or window.tabs.currentIndex() != 0
+        ):
+            return False
+
+        if self._modern():
+            return window.lifecycle.phase is DesktopPhase.CONNECTED
 
         return bool(
-            not w._closing
-            and not w._paused
-            and not w._busy
-            and w.controller.running
-            and w.tabs.currentIndex() == 0
-            and "local" in w._loaded
-            and w._render_kind is None
+            not window._paused
+            and "local" in window._loaded
+            and window._render_kind is None
         )
 
     def _on_tab_changed(self, index: int) -> None:
@@ -65,16 +73,17 @@ class QtLocalFileRefresh(QObject):
         except Exception:
             return
 
+        modern = self._modern()
         self._scanning = True
 
         def scan() -> None:
             try:
-                result = self.window._list_local(root)
+                if modern:
+                    result = self.window._list_local()
+                else:
+                    result = self.window._list_local(root)
                 self.scan_finished.emit(str(root), result)
-
             except Exception:
-                # A transient filesystem error should not stop the UI.
-                # If the window was destroyed, the signal may no longer exist.
                 try:
                     self.scan_failed.emit()
                 except RuntimeError:
@@ -93,7 +102,6 @@ class QtLocalFileRefresh(QObject):
     @Slot(str, object)
     def _apply_result(self, checked_root: str, result) -> None:
         self._scanning = False
-
         if not self._eligible():
             return
 
@@ -107,21 +115,22 @@ class QtLocalFileRefresh(QObject):
         if str(current_root) != checked_root:
             return
 
-        rows, _truncated = result
+        modern = self._modern()
+        rows = result if modern else result[0]
         table = self.window.local_table
 
         if table.rowCount() == len(rows):
-            same = all(
-                table.item(i, 0) is not None
-                and table.item(i, 1) is not None
-                and table.item(i, 0).text() == str(path)
-                and table.item(i, 1).text() == self.window._size(size)
-                for i, (path, size) in enumerate(rows)
+            unchanged = all(
+                table.item(index, 0) is not None
+                and table.item(index, 1) is not None
+                and table.item(index, 0).text() == str(path)
+                and table.item(index, 1).text() == self.window._size(size)
+                for index, (path, size) in enumerate(rows)
             )
-
-            if same:
+            if unchanged:
                 return
 
-        # The receiver's directory really changed: reuse the GUI's tested
-        # batched-rendering path. Never perform Preview or Sync here.
-        self.window._display_files("local", result)
+        if modern:
+            self.window._show_files(table, rows)
+        else:
+            self.window._display_files("local", result)
