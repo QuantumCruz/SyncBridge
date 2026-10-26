@@ -1,8 +1,8 @@
 
-"""Launch SyncBridge with explicit, mutually approved desktop connections.
+"""Launch the Windows-first SyncBridge desktop with guarded recovery.
 
-Fresh profiles use the Windows computer name for discovery. A user may change
-that label in the Qt interface without changing their cryptographic identity.
+Fresh profiles use the local Windows hostname; users can rename the device in
+SyncBridge without changing the authenticated pairing identity.
 """
 from __future__ import annotations
 
@@ -23,7 +23,9 @@ from syncbridge.ui.qt_onboarding import NetworkOptions
 from syncbridge.ui.qt_direct_discovery_window import (
     discovery_targets_for_interfaces,
 )
-from syncbridge.ui.qt_release_window import SyncBridgeReleaseWindow
+from syncbridge.ui.qt_crash_recovery_window import (
+    SyncBridgeCrashRecoveryWindow,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,14 +41,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discovery-bind", default="0.0.0.0")
     parser.add_argument("--discovery-name")
     parser.add_argument(
-        "--discovery-target", action="append", metavar="IP:PORT",
+        "--discovery-target",
+        action="append",
+        metavar="IP:PORT",
     )
     parser.add_argument("--pairing-port", type=int, default=PAIRING_PORT)
     parser.add_argument("--pairing-bind", default="0.0.0.0")
     parser.add_argument("--setup-port", type=int, default=SETUP_PORT)
     parser.add_argument("--remote-setup-port", type=int, default=SETUP_PORT)
     parser.add_argument("--activation-port", type=int, default=ACTIVATION_PORT)
-    parser.add_argument("--remote-activation-port", type=int, default=ACTIVATION_PORT)
+    parser.add_argument(
+        "--remote-activation-port",
+        type=int,
+        default=ACTIVATION_PORT,
+    )
+
     args = parser.parse_args(argv)
 
     if args.discovery_target:
@@ -54,8 +63,7 @@ def main(argv: list[str] | None = None) -> int:
             targets = tuple(
                 (host, int(port))
                 for host, port in (
-                    value.rsplit(":", 1)
-                    for value in args.discovery_target
+                    item.rsplit(":", 1) for item in args.discovery_target
                 )
             )
         except ValueError as exc:
@@ -96,9 +104,13 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("SyncBridge")
 
-    window = SyncBridgeReleaseWindow(controller, network_options=options)
+    window = SyncBridgeCrashRecoveryWindow(
+        controller,
+        network_options=options,
+    )
     window.local_view_refresh = QtLocalFileRefresh(window)
     window.show()
+
     return app.exec()
 
 
