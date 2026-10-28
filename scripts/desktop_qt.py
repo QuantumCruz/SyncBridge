@@ -1,8 +1,8 @@
 
-"""Launch the Windows-first SyncBridge desktop with guarded recovery.
+"""Launch the Windows-first SyncBridge desktop with safe fresh setup.
 
-Fresh profiles use the local Windows hostname; users can rename the device in
-SyncBridge without changing the authenticated pairing identity.
+Computer identities and recovery histories survive restarts. Connecting to
+a known computer still requires explicit approval on both devices.
 """
 from __future__ import annotations
 
@@ -23,13 +23,14 @@ from syncbridge.ui.qt_onboarding import NetworkOptions
 from syncbridge.ui.qt_direct_discovery_window import (
     discovery_targets_for_interfaces,
 )
-from syncbridge.ui.qt_crash_recovery_window import (
-    SyncBridgeCrashRecoveryWindow,
+from syncbridge.ui.qt_clean_start_window import (
+    SyncBridgeCleanStartWindow,
 )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SyncBridge desktop")
+
     parser.add_argument("--profile", type=Path)
     parser.add_argument("--bind-address", default="0.0.0.0")
     parser.add_argument("--listen-ports", type=int, nargs=3)
@@ -40,11 +41,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--discovery-port", type=int, default=DISCOVERY_PORT)
     parser.add_argument("--discovery-bind", default="0.0.0.0")
     parser.add_argument("--discovery-name")
+
     parser.add_argument(
         "--discovery-target",
         action="append",
         metavar="IP:PORT",
     )
+
     parser.add_argument("--pairing-port", type=int, default=PAIRING_PORT)
     parser.add_argument("--pairing-bind", default="0.0.0.0")
     parser.add_argument("--setup-port", type=int, default=SETUP_PORT)
@@ -72,7 +75,9 @@ def main(argv: list[str] | None = None) -> int:
         targets = discovery_targets_for_interfaces()
 
     store = ConfigStore(
-        args.profile / "settings.json" if args.profile else None
+        args.profile / "settings.json"
+        if args.profile
+        else None
     )
     initialize_device_name(store)
 
@@ -80,7 +85,9 @@ def main(argv: list[str] | None = None) -> int:
         store,
         bind_address=args.bind_address,
         listen_ports=(
-            tuple(args.listen_ports) if args.listen_ports else None
+            tuple(args.listen_ports)
+            if args.listen_ports
+            else None
         ),
         lock_port=args.lock_port,
         validation_port=args.validation_port,
@@ -104,7 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("SyncBridge")
 
-    window = SyncBridgeCrashRecoveryWindow(
+    window = SyncBridgeCleanStartWindow(
         controller,
         network_options=options,
     )
