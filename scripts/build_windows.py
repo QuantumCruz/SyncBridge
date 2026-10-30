@@ -1,13 +1,13 @@
 
-"""Build the real SyncBridge Qt desktop as a standalone Windows folder.
+"""Build and audit the Windows-first SyncBridge Qt desktop.
 
-Run from any working directory using the project's Python environment:
+Normal user build (no console):
     python scripts/build_windows.py
-
-For a diagnostic build that keeps a console window:
+Diagnostic build (visible console):
     python scripts/build_windows.py --console
 
-This build does not modify user profiles or synchronized folders.
+A successful PyInstaller return code is not sufficient. The generated EXE
+must also have the expected Windows subsystem and contain no private profiles.
 """
 from __future__ import annotations
 
@@ -22,13 +22,14 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parent.parent
 SOURCE = PROJECT / "src"
 ENTRY = PROJECT / "scripts" / "desktop_qt.py"
+AUDIT = PROJECT / "scripts" / "windows_release_audit.py"
 DIST = PROJECT / "dist"
 WORK = PROJECT / "build" / "windows-pyinstaller"
 EXE = DIST / "SyncBridge" / "SyncBridge.exe"
 
 
 class BuildError(RuntimeError):
-    """A prerequisite for producing the Windows application is missing."""
+    """A prerequisite for a reliable Windows application build is missing."""
 
 
 def _preflight() -> None:
@@ -39,9 +40,12 @@ def _preflight() -> None:
 
     required = (
         ENTRY,
+        AUDIT,
         SOURCE / "syncbridge" / "ui" / "desktop_controller.py",
         SOURCE / "syncbridge" / "ui" / "qt_onboarding.py",
-        SOURCE / "syncbridge" / "ui" / "qt_progress_window.py",
+        SOURCE / "syncbridge" / "ui" / "qt_clean_start_window.py",
+        SOURCE / "syncbridge" / "ui" / "qt_crash_recovery_window.py",
+        SOURCE / "syncbridge" / "storage" / "folder_change_recovery.py",
         SOURCE / "syncbridge" / "ui" / "qt_local_refresh.py",
     )
     missing = [
@@ -50,20 +54,14 @@ def _preflight() -> None:
         if not path.is_file()
     ]
     if missing:
-        raise BuildError(
-            "Missing Qt desktop source file(s): " + ", ".join(missing)
-        )
+        raise BuildError("Missing SyncBridge source file(s): " + ", ".join(missing))
 
-    if importlib.util.find_spec("PyInstaller") is None:
-        raise BuildError(
-            'PyInstaller is not installed. Run: '
-            'python -m pip install "pyinstaller>=6,<7"'
-        )
-    if importlib.util.find_spec("PySide6") is None:
-        raise BuildError(
-            "PySide6 is missing from this Python environment. Activate the "
-            "SyncBridge virtual environment before building."
-        )
+    for package in ("PyInstaller", "PySide6", "cryptography"):
+        if importlib.util.find_spec(package) is None:
+            raise BuildError(
+                f"{package} is not installed. "
+                'Run: python -m pip install -e ".[dev,build]"'
+            )
 
 
 def _command(*, console: bool) -> list[str]:
@@ -88,15 +86,9 @@ def _command(*, console: bool) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Build a standalone Windows distribution "
-            "of the SyncBridge Qt desktop."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Build the SyncBridge Windows app")
     parser.add_argument(
-        "--console",
-        action="store_true",
+        "--console", action="store_true",
         help="Keep a console window for diagnosing startup problems.",
     )
     args = parser.parse_args(argv)
@@ -109,52 +101,54 @@ def main(argv: list[str] | None = None) -> int:
     (WORK / "spec").mkdir(parents=True, exist_ok=True)
     (WORK / "work").mkdir(parents=True, exist_ok=True)
 
-    print(
-        "Building the PySide6 SyncBridge desktop "
-        "(not the Tkinter prototype).",
-        flush=True,
-    )
+    print("Building the SyncBridge PySide6 desktop.", flush=True)
     print(f"Python: {sys.executable}", flush=True)
     print(f"Entry:  {ENTRY}", flush=True)
     print(f"Output: {EXE}", flush=True)
+    print(
+        "Mode: diagnostic console" if args.console else "Mode: windowed desktop",
+        flush=True,
+    )
 
     try:
-        completed = subprocess.run(
-            _command(console=args.console),
-            cwd=PROJECT,
-            check=False,
-        )
+        build = subprocess.run(_command(console=args.console), cwd=PROJECT, check=False)
     except OSError as exc:
+        print(f"Could not run PyInstaller: {exc}", file=sys.stderr)
+        return 1
+
+    if build.returncode != 0:
         print(
-            f"Could not start PyInstaller: {exc}",
+            f"PyInstaller failed (exit {build.returncode}).",
+            file=sys.stderr,
+        )
+        return build.returncode
+
+    verification = [
+        sys.executable, str(AUDIT),
+        "--dist", str(EXE.parent),
+        "--project-root", str(PROJECT),
+    ]
+    if args.console:
+        verification.append("--console")
+
+    try:
+        audited = subprocess.run(verification, cwd=PROJECT, check=False)
+    except OSError as exc:
+        print(f"Could not audit packaged EXE: {exc}", file=sys.stderr)
+        return 1
+    if audited.returncode != 0:
+        print(
+            "Build was produced but FAILED release audit. Do not share it.",
             file=sys.stderr,
         )
         return 1
 
-    if completed.returncode != 0:
-        print(
-            f"PyInstaller failed with exit code {completed.returncode}.",
-            file=sys.stderr,
-        )
-        return completed.returncode
-
-    if not EXE.is_file():
-        print(
-            f"Build ended without creating {EXE}.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print("\nWindows build complete.", flush=True)
+    print("\nWindows build and offline audit complete.", flush=True)
     print(f"Run: {EXE}", flush=True)
+    print("Distribute the whole dist\\SyncBridge folder, not only SyncBridge.exe.")
     print(
-        "Distribute the whole dist\\SyncBridge folder, "
-        "not only SyncBridge.exe."
-    )
-    print(
-        "This is a build artifact, not a verified public release. "
-        "Test first-run pairing, folder setup, sync and crash "
-        "recovery on the packaged app."
+        "Do not publish until packaged transfer tests and real two-computer "
+        "reconnect testing have also passed."
     )
     return 0
 
