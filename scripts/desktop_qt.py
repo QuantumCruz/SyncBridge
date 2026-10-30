@@ -1,10 +1,9 @@
 
-"""Launch SyncBridge with clean sessions and polished onboarding.
+"""Launch the branded SyncBridge desktop with safe, clean startup settings.
 
-Normal double-click launches begin with fresh pairing and folder settings.
-Explicit --profile launches retain saved state for controlled testing.
-
-User files, local device identity, and recovery history are preserved.
+A normal launch does not remember an old folder relationship. Explicit
+--profile sessions retain their approved settings for controlled testing.
+Recovery remains authoritative and is never silently discarded.
 """
 from __future__ import annotations
 
@@ -20,6 +19,10 @@ from syncbridge.network.share_activation import ACTIVATION_PORT
 from syncbridge.network.share_setup import SETUP_PORT
 from syncbridge.storage.config import ConfigStore
 from syncbridge.storage.folder_change_recovery import FolderChangeJournal
+from syncbridge.ui.branding import (
+    apply_application_branding,
+    configure_windows_app_identity,
+)
 from syncbridge.ui.device_names import initialize_device_name
 from syncbridge.ui.fresh_start import start_fresh_locally
 from syncbridge.ui.preview_diagnostics import DiagnosticDesktopController
@@ -31,13 +34,15 @@ from syncbridge.ui.qt_onboarding_presentation import (
 from syncbridge.ui.qt_direct_discovery_window import (
     discovery_targets_for_interfaces,
 )
-from syncbridge.ui.qt_polished_window import SyncBridgePolishedWindow
+from syncbridge.ui.qt_review_window import SyncBridgeReviewWindow
 
 
 def _prepare_profile(
-    store: ConfigStore, *, persistent: bool
+    store: ConfigStore,
+    *,
+    persistent: bool,
 ) -> str:
-    """Apply startup policy before opening network listeners."""
+    """Choose startup policy without discarding pending recovery."""
     if persistent:
         return "persistent"
 
@@ -67,13 +72,11 @@ def main(argv: list[str] | None = None) -> int:
         "--discovery-bind", default="0.0.0.0"
     )
     parser.add_argument("--discovery-name")
-
     parser.add_argument(
         "--discovery-target",
         action="append",
         metavar="IP:PORT",
     )
-
     parser.add_argument(
         "--pairing-port", type=int, default=PAIRING_PORT
     )
@@ -90,9 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         "--activation-port", type=int, default=ACTIVATION_PORT
     )
     parser.add_argument(
-        "--remote-activation-port",
-        type=int,
-        default=ACTIVATION_PORT,
+        "--remote-activation-port", type=int, default=ACTIVATION_PORT
     )
 
     args = parser.parse_args(argv)
@@ -102,14 +103,12 @@ def main(argv: list[str] | None = None) -> int:
             targets = tuple(
                 (host, int(port))
                 for host, port in (
-                    item.rsplit(":", 1)
-                    for item in args.discovery_target
+                    value.rsplit(":", 1)
+                    for value in args.discovery_target
                 )
             )
         except ValueError as exc:
-            parser.error(
-                f"Invalid discovery target: {exc}"
-            )
+            parser.error(f"Invalid discovery target: {exc}")
     else:
         targets = discovery_targets_for_interfaces()
 
@@ -119,19 +118,16 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
 
+    # Set Windows taskbar identity before creating QApplication/windows.
+    configure_windows_app_identity()
     app = QApplication.instance() or QApplication([])
     app.setApplicationName("SyncBridge")
 
     try:
-        store.path.parent.mkdir(
-            parents=True, exist_ok=True
-        )
+        store.path.parent.mkdir(parents=True, exist_ok=True)
 
         instance_lock = QLockFile(
-            str(
-                store.path.parent
-                / ".syncbridge-desktop.lock"
-            )
+            str(store.path.parent / ".syncbridge-desktop.lock")
         )
         instance_lock.setStaleLockTime(0)
 
@@ -143,12 +139,9 @@ def main(argv: list[str] | None = None) -> int:
                 "Use the existing window instead.",
             )
             return 1
-
     except OSError as exc:
         QMessageBox.critical(
-            None,
-            "Cannot start SyncBridge",
-            str(exc),
+            None, "Cannot start SyncBridge", str(exc)
         )
         return 1
 
@@ -156,10 +149,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             initialize_device_name(store)
             _prepare_profile(
-                store,
-                persistent=args.profile is not None,
+                store, persistent=args.profile is not None
             )
-
         except Exception as exc:
             QMessageBox.critical(
                 None,
@@ -198,25 +189,20 @@ def main(argv: list[str] | None = None) -> int:
             remote_activation_port=args.remote_activation_port,
         )
 
-        window = SyncBridgePolishedWindow(
-            controller,
-            network_options=options,
+        window = SyncBridgeReviewWindow(
+            controller, network_options=options
         )
-
+        apply_application_branding(app, window)
         onboarding_presenter = install_onboarding_presentation(app)
 
-        # Our Options control is a regular QPushButton.
-        # The chevron is part of the label, so Qt will not draw
-        # an additional native dropdown indicator.
         window._options_button.setText("Options  ▾")
-
         window.local_view_refresh = QtLocalFileRefresh(window)
         window.show()
 
-        result = app.exec()
-        app.removeEventFilter(onboarding_presenter)
-        return result
-
+        try:
+            return app.exec()
+        finally:
+            app.removeEventFilter(onboarding_presenter)
     finally:
         instance_lock.unlock()
 

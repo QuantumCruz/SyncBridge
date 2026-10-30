@@ -1,5 +1,9 @@
 
-"""The streamlined desktop keeps real actions while hiding idle clutter."""
+"""The polished desktop must retain correct controls and lifecycle behavior.
+
+Uses production preview models rather than placeholder objects, so changes
+to the UI presentation are tested against the controller's real contract.
+"""
 from __future__ import annotations
 
 import os
@@ -18,16 +22,28 @@ def _exercise(tmp_path: Path, monkeypatch) -> None:
     from PySide6.QtWidgets import QApplication
 
     from syncbridge.storage.config import ConfigStore, ShareConfig
-    from syncbridge.ui.desktop_controller import DesktopPhase
+    from syncbridge.ui.desktop_controller import (
+        DesktopPhase,
+        DesktopPlanItem,
+        DesktopPreview,
+    )
     from syncbridge.ui.qt_onboarding import NetworkOptions
     from syncbridge.ui.qt_polished_window import SyncBridgePolishedWindow
 
     profile = tmp_path / "profile"
     profile.mkdir()
+
     folder = tmp_path / "shared"
     folder.mkdir()
 
+    test_file = folder / "report.txt"
+    test_file.write_text(
+        "SyncBridge UI regression test",
+        encoding="utf-8",
+    )
+
     store = ConfigStore(profile / "settings.json")
+
     share = ShareConfig(
         share_id="a" * 32,
         peer_node_id="b" * 32,
@@ -40,7 +56,10 @@ def _exercise(tmp_path: Path, monkeypatch) -> None:
         grant_write=True,
         grant_agreement=True,
     )
-    store.save(replace(store.load(), shares=(share,)))
+
+    store.save(
+        replace(store.load(), shares=(share,))
+    )
 
     class Controller:
         def __init__(self):
@@ -51,7 +70,7 @@ def _exercise(tmp_path: Path, monkeypatch) -> None:
         def stop(self):
             self.running = False
 
-    # Exercise actual Qt widgets but do not open network sockets.
+    # Exercise actual Qt controls without opening network sockets.
     def no_network(window):
         window._network_started = True
         window._apply_state()
@@ -67,15 +86,18 @@ def _exercise(tmp_path: Path, monkeypatch) -> None:
     app.setQuitOnLastWindowClosed(False)
 
     controller = Controller()
+
     window = SyncBridgePolishedWindow(
         controller,
         network_options=NetworkOptions(),
     )
+
     window.show()
 
     try:
         app.processEvents()
 
+        # Disconnected: only relevant controls should appear.
         assert window.windowTitle() == "SyncBridge"
         assert window._empty_panel.isVisible()
         assert not window.tabs.isVisible()
@@ -92,6 +114,7 @@ def _exercise(tmp_path: Path, monkeypatch) -> None:
             "The other computer could not be reached."
         )
         window._apply_state()
+
         assert window.summary.isVisible()
 
         # Simulate an approved live connection.
@@ -100,38 +123,67 @@ def _exercise(tmp_path: Path, monkeypatch) -> None:
         controller.running = True
         window._move(DesktopPhase.CONNECTED)
 
-        assert window.connection.text().startswith("Connected to ")
+        assert window.connection.text().startswith(
+            "Connected to "
+        )
         assert window._empty_panel.isVisible()
         assert not window.tabs.isVisible()
         assert window.preview_button.isVisible()
         assert not window.sync_button.isVisible()
         assert not window._fresh_action.isEnabled()
 
-        # A valid preview reveals file changes and the Sync action.
-        window._preview = SimpleNamespace(
-            items=(object(),),
+        # Use the production preview contract.
+        # A safe proposed change should reveal the Sync action.
+        plan_item = DesktopPlanItem(
+            path=test_file.name,
+            action="Send",
+            description="Copy this version to the paired computer",
+            needs_review=False,
+            size=test_file.stat().st_size,
+        )
+
+        preview = DesktopPreview(
+            revision=0,
+            items=(plan_item,),
             requires_review=False,
         )
+
+        window._preview = preview
         window._apply_state()
 
         assert window.tabs.isVisible()
         assert not window._empty_panel.isVisible()
         assert window.sync_button.isVisible()
+        assert "1 proposed change(s)" in window._preview_info.text()
+        assert "1 to send" in window._preview_info.text()
 
-        # Syncing must never be shown as disconnected.
+        # Synchronization must retain the connected banner.
         window._busy = True
         window._move(DesktopPhase.SYNCHRONIZING)
 
-        assert window.connection.text().startswith("Connected to ")
+        assert window.connection.text().startswith(
+            "Connected to "
+        )
         assert window.status.text() == "Synchronizing"
         assert "not connected" not in window.hint.text().lower()
 
-        # Disconnect removes the file controls again.
+        # The app should not expose conflicting actions during sync.
+        assert not window.preview_button.isEnabled()
+        assert not window.sync_button.isEnabled()
+
+        # Return to the connected state.
         window._busy = False
-        window._preview = None
         window._move(DesktopPhase.CONNECTED)
+
+        assert window.connection.text().startswith(
+            "Connected to "
+        )
+
+        # Disconnect removes the file controls again.
+        window._preview = None
         window._live_session = None
         controller.running = False
+
         window._move(DesktopPhase.DISCONNECTING)
         window._move(DesktopPhase.DISCONNECTED)
 
@@ -139,6 +191,11 @@ def _exercise(tmp_path: Path, monkeypatch) -> None:
         assert window._empty_panel.isVisible()
         assert not window.sync_button.isVisible()
         assert window._fresh_action.isEnabled()
+
+        # GUI-only operations must never modify user files.
+        assert test_file.read_text(
+            encoding="utf-8"
+        ) == "SyncBridge UI regression test"
 
     finally:
         window._close_allowed = True

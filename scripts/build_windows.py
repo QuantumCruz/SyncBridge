@@ -7,7 +7,8 @@ Diagnostic build (visible console):
     python scripts/build_windows.py --console
 
 A successful PyInstaller return code is not sufficient. The generated EXE
-must also have the expected Windows subsystem and contain no private profiles.
+must have the expected Windows subsystem and contain no private profiles.
+The executable's Windows icon is generated from SyncBridge's Qt artwork.
 """
 from __future__ import annotations
 
@@ -23,6 +24,8 @@ PROJECT = Path(__file__).resolve().parent.parent
 SOURCE = PROJECT / "src"
 ENTRY = PROJECT / "scripts" / "desktop_qt.py"
 AUDIT = PROJECT / "scripts" / "windows_release_audit.py"
+ICON_GENERATOR = PROJECT / "scripts" / "generate_windows_icon.py"
+ICON = PROJECT / "assets" / "windows" / "SyncBridge.ico"
 DIST = PROJECT / "dist"
 WORK = PROJECT / "build" / "windows-pyinstaller"
 EXE = DIST / "SyncBridge" / "SyncBridge.exe"
@@ -35,18 +38,21 @@ class BuildError(RuntimeError):
 def _preflight() -> None:
     if os.name != "nt":
         raise BuildError("Build the Windows executable on Windows 10 or 11.")
-    if sys.version_info < (3, 10):
-        raise BuildError("SyncBridge needs Python 3.10 or newer to build.")
+    if sys.version_info < (3, 12):
+        raise BuildError("SyncBridge needs Python 3.12 or newer to build.")
 
     required = (
         ENTRY,
         AUDIT,
+        ICON_GENERATOR,
+        SOURCE / "syncbridge" / "ui" / "branding.py",
         SOURCE / "syncbridge" / "ui" / "desktop_controller.py",
         SOURCE / "syncbridge" / "ui" / "qt_onboarding.py",
         SOURCE / "syncbridge" / "ui" / "qt_clean_start_window.py",
         SOURCE / "syncbridge" / "ui" / "qt_crash_recovery_window.py",
         SOURCE / "syncbridge" / "storage" / "folder_change_recovery.py",
         SOURCE / "syncbridge" / "ui" / "qt_local_refresh.py",
+        SOURCE / "syncbridge" / "ui" / "qt_review_window.py",
     )
     missing = [
         str(path.relative_to(PROJECT))
@@ -54,7 +60,9 @@ def _preflight() -> None:
         if not path.is_file()
     ]
     if missing:
-        raise BuildError("Missing SyncBridge source file(s): " + ", ".join(missing))
+        raise BuildError(
+            "Missing SyncBridge source file(s): " + ", ".join(missing)
+        )
 
     for package in ("PyInstaller", "PySide6", "cryptography"):
         if importlib.util.find_spec(package) is None:
@@ -62,6 +70,22 @@ def _preflight() -> None:
                 f"{package} is not installed. "
                 'Run: python -m pip install -e ".[dev,build]"'
             )
+
+
+def _generate_icon() -> None:
+    try:
+        result = subprocess.run(
+            [sys.executable, str(ICON_GENERATOR)],
+            cwd=PROJECT,
+            check=False,
+        )
+    except OSError as exc:
+        raise BuildError(f"Cannot start the icon generator: {exc}") from exc
+    if result.returncode != 0 or not ICON.is_file():
+        raise BuildError(
+            "SyncBridge icon generation failed. "
+            "Do not build with an old or missing application icon."
+        )
 
 
 def _command(*, console: bool) -> list[str]:
@@ -74,6 +98,7 @@ def _command(*, console: bool) -> list[str]:
         "--console" if console else "--windowed",
         "--noupx",
         "--name", "SyncBridge",
+        "--icon", str(ICON),
         "--paths", str(SOURCE),
         "--distpath", str(DIST),
         "--workpath", str(WORK / "work"),
@@ -86,7 +111,9 @@ def _command(*, console: bool) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Build the SyncBridge Windows app")
+    parser = argparse.ArgumentParser(
+        description="Build the SyncBridge Windows app"
+    )
     parser.add_argument(
         "--console", action="store_true",
         help="Keep a console window for diagnosing startup problems.",
@@ -95,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         _preflight()
+        _generate_icon()
     except BuildError as exc:
         parser.exit(2, f"Build preparation failed: {exc}\n")
 
@@ -104,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
     print("Building the SyncBridge PySide6 desktop.", flush=True)
     print(f"Python: {sys.executable}", flush=True)
     print(f"Entry:  {ENTRY}", flush=True)
+    print(f"Icon:   {ICON}", flush=True)
     print(f"Output: {EXE}", flush=True)
     print(
         "Mode: diagnostic console" if args.console else "Mode: windowed desktop",
@@ -111,7 +140,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        build = subprocess.run(_command(console=args.console), cwd=PROJECT, check=False)
+        build = subprocess.run(
+            _command(console=args.console),
+            cwd=PROJECT,
+            check=False,
+        )
     except OSError as exc:
         print(f"Could not run PyInstaller: {exc}", file=sys.stderr)
         return 1
@@ -136,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"Could not audit packaged EXE: {exc}", file=sys.stderr)
         return 1
+
     if audited.returncode != 0:
         print(
             "Build was produced but FAILED release audit. Do not share it.",
